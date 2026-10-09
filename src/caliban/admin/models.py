@@ -12,12 +12,13 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from ..types import ModelCapabilities, ModelKind, TrustTier
+from ..types import CacheTier, ModelCapabilities, ModelKind, RouteStage, TrustTier
 
 __all__ = [
     "ApiKeyCreate",
     "ApiKeyCreated",
     "ApiKeyInfo",
+    "CacheTier",
     "Datasource",
     "DatasourceCreate",
     "DatasourceKind",
@@ -38,15 +39,19 @@ __all__ = [
     "OntologyProvenance",
     "OntologyReview",
     "PiiMode",
+    "PiiSurrogateScope",
     "ProviderHealth",
     "ProviderKey",
     "ProviderKeyCreate",
     "ProviderKind",
+    "RouteStage",
+    "SemanticCacheSetting",
     "SharedProvider",
     "SharedProviderCreate",
     "Tenant",
     "TenantCreate",
     "TenantStatus",
+    "TenantUpdate",
     "TrustTier",
     "UsageEvent",
     "UsageReport",
@@ -54,6 +59,10 @@ __all__ = [
 ]
 
 PiiMode = Literal["off", "mask", "reversible"]
+PiiSurrogateScope = Literal["tenant", "session"]
+"""``tenant`` (default): one surrogate per value within the tenant, so pseudonymised requests
+can hit the exact cache but become linkable. ``session``: fresh surrogates per request."""
+SemanticCacheSetting = Literal["off", "on"]
 TenantStatus = Literal["active", "deleted"]
 ProviderKind = Literal[
     "openai", "anthropic", "openai_compatible", "azure_openai", "bedrock", "vertex"
@@ -109,6 +118,10 @@ class Tenant(_Response):
     name: str
     region: str | None = None
     pii_default: PiiMode | None = None
+    pii_surrogate_scope: PiiSurrogateScope | None = None
+    """Surrogate consistency for reversible PII. ``None`` from older servers."""
+    semantic_cache: SemanticCacheSetting | None = None
+    """Whether the tenant may use the semantic cache. ``None`` from older servers."""
     created_at: datetime
     status: TenantStatus | None = None
     """``"deleted"`` only appears with ``include_deleted=True``. ``None`` from older servers."""
@@ -119,6 +132,16 @@ class TenantCreate(_Request):
     name: str
     region: str | None = None
     pii_default: PiiMode | None = None
+    pii_surrogate_scope: PiiSurrogateScope | None = None
+    semantic_cache: SemanticCacheSetting | None = None
+
+
+class TenantUpdate(_Request):
+    """Body of ``PATCH /api/v1/tenants/{tenantId}``. Unset fields keep their value."""
+
+    pii_default: PiiMode | None = None
+    pii_surrogate_scope: PiiSurrogateScope | None = None
+    semantic_cache: SemanticCacheSetting | None = None
 
 
 class ApiKeyInfo(_Response):
@@ -323,13 +346,28 @@ class UsageEvent(_Response):
     completion_tokens: int
     cached_prompt_tokens: int | None = None
     tokens_saved: int | None = None
-    """Tokens not sent upstream thanks to Caliban (e.g. cache hits)."""
+    """Tokens not sent upstream thanks to Caliban: on a cache hit of either tier, the cached
+    answer's prompt plus completion tokens."""
     intent: str | None = None
     cache: Literal["hit", "miss", "bypass"]
+    cache_tier: CacheTier | None = None
+    """Only on hits: which cache tier answered."""
     pii_entities: int | None = None
     cost_usd: float | None = None
     latency_ms: int
     ts: datetime
+    requested_model: str | None = None
+    """The model the client asked for (``caliban/auto`` or a pinned id). Chat requests only."""
+    intent_confidence: float | None = None
+    """Confidence of the intent decision, 0..1. Chat requests only."""
+    route_stage: RouteStage | None = None
+    """Stage that decided the intent. Chat requests only."""
+    routed_model_cost_usd: float | None = None
+    """``caliban/auto`` only: real cost of the routed model for this request. Absent when the
+    model has no price."""
+    flat_price_usd: float | None = None
+    """``caliban/auto`` only: the flat auto price for the same tokens; ``0`` on a cache hit.
+    Margin is ``flat_price_usd - routed_model_cost_usd``."""
 
 
 class UsageTotals(_Response):
@@ -337,8 +375,18 @@ class UsageTotals(_Response):
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
     cache_hits: int | None = None
+    """Hits of both cache tiers."""
+    semantic_cache_hits: int | None = None
     tokens_saved: int | None = None
     cost_usd: float | None = None
+    auto_requests: int | None = None
+    """Requests that asked for ``caliban/auto``."""
+    flat_price_usd: float | None = None
+    """Sum over ``caliban/auto`` events that carry both prices."""
+    routed_model_cost_usd: float | None = None
+    """Sum over the same events."""
+    margin_usd: float | None = None
+    """``flat_price_usd - routed_model_cost_usd``."""
 
 
 class UsageReport(_Response):

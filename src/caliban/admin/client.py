@@ -39,14 +39,17 @@ from .models import (
     OntologyElement,
     OntologyReview,
     PiiMode,
+    PiiSurrogateScope,
     ProviderHealth,
     ProviderKey,
     ProviderKeyCreate,
     ProviderKind,
+    SemanticCacheSetting,
     SharedProvider,
     SharedProviderCreate,
     Tenant,
     TenantCreate,
+    TenantUpdate,
     TrustTier,
     UsageReport,
 )
@@ -89,6 +92,10 @@ class _Resource:
         # Not idempotent: retried on 429/503 only, never 502 (the server may have acted).
         return self._admin._http.request("POST", path, json=body)
 
+    def _patch(self, path: str, body: Any) -> httpx.Response:
+        # Not idempotent by default (each call is audited): retried on 429/503 only.
+        return self._admin._http.request("PATCH", path, json=body)
+
     def _delete(self, path: str) -> httpx.Response:
         return self._admin._http.request("DELETE", path)
 
@@ -121,10 +128,46 @@ class Tenants(_Resource):
         self._delete(f"tenants/{_p(tenant_id)}")
 
     def create(
-        self, *, name: str, region: str | None = None, pii_default: PiiMode | None = None
+        self,
+        *,
+        name: str,
+        region: str | None = None,
+        pii_default: PiiMode | None = None,
+        pii_surrogate_scope: PiiSurrogateScope | None = None,
+        semantic_cache: SemanticCacheSetting | None = None,
     ) -> Tenant:
-        body = TenantCreate(name=name, region=region, pii_default=pii_default).to_body()
+        body = TenantCreate(
+            name=name,
+            region=region,
+            pii_default=pii_default,
+            pii_surrogate_scope=pii_surrogate_scope,
+            semantic_cache=semantic_cache,
+        ).to_body()
         return self._one(Tenant, self._post("tenants", body))
+
+    def update(
+        self,
+        tenant_id: str,
+        *,
+        pii_default: PiiMode | None = None,
+        pii_surrogate_scope: PiiSurrogateScope | None = None,
+        semantic_cache: SemanticCacheSetting | None = None,
+    ) -> Tenant:
+        """Change a tenant's PII and cache settings (``PATCH``). Omitted fields keep their value.
+
+        ``pii_surrogate_scope="session"`` gives every request fresh PII surrogates (requests
+        cannot be linked through them, and requests carrying PII bypass the caches);
+        ``"tenant"`` (the default) keeps one surrogate per value within the tenant.
+        ``semantic_cache="on"`` lets eligible requests use the semantic cache (the deployment
+        must enable it too). Audited as ``tenant.update``; routers apply the change with their
+        next snapshot. Raises :class:`~caliban.NotFoundError` for an unknown or deleted tenant.
+        """
+        body = TenantUpdate(
+            pii_default=pii_default,
+            pii_surrogate_scope=pii_surrogate_scope,
+            semantic_cache=semantic_cache,
+        ).to_body()
+        return self._one(Tenant, self._patch(f"tenants/{_p(tenant_id)}", body))
 
 
 class ApiKeys(_Resource):

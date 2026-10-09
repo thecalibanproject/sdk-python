@@ -73,7 +73,7 @@ Every data-plane request body can carry a `caliban` object. Clients that do not 
 | Field | Values | Meaning |
 |---|---|---|
 | `pii` | `off`, `mask`, `reversible` | How PII is handled before text leaves your trust boundary. `mask` replaces entities with placeholders such as `[EMAIL]`; `reversible` pseudonymises them and restores the originals in the response. |
-| `cache` | `off`, `exact`, `semantic` | Response cache mode. |
+| `cache` | `off`, `exact`, `semantic` | Response cache mode. `off`: no cache. `exact`: exact cache only. `semantic`: exact, then the semantic cache if the tenant has it on, whatever the temperature. Unset: exact, plus semantic up to the gateway's temperature limit if the tenant has it on (see [Tenant settings](#tenant-settings)). |
 | `datasources` | `list[str]` | Datasources (by name) the request may query through the ontology layer. |
 | `node` | `str` | Run the request through a named node (agent). |
 | `max_cost_usd` | `float`, `>= 0` | Cost ceiling for the request. |
@@ -112,11 +112,26 @@ The gateway reports what it did in `x-caliban-*` response headers. Completions, 
 |---|---|---|
 | `x-caliban-request-id` | `request_id` | Quote it in bug reports. |
 | `x-caliban-routed-model` | `routed_model` | The model the router actually used (useful with `caliban/auto`). |
-| `x-caliban-cache` | `cache` | `hit`, `miss` or `bypass`. |
+| `x-caliban-cache` | `cache` | `hit`, `miss` or `bypass`. `hit` covers both cache tiers. |
+| `x-caliban-cache-tier` | `cache_tier` | `"exact"` or `"semantic"`, sent on hits only. `None` otherwise. |
+| `x-caliban-intent` | `intent` | The routing decision, parsed into an `IntentDecision` (`intent`, `confidence`, `stage`, `knn_reason`). `None` when absent or malformed. |
 | `x-caliban-pii-entities` | `pii_entities` | Number of PII entities detected and protected. |
 | `x-caliban-cost-usd` | `cost_usd` | Non-streaming responses only; `None` when the model has no price. |
 
 `headers` holds every `x-caliban-*` header, lower-cased. Response models allow extra fields, so provider-specific fields survive (see `resp.model_extra`).
+
+The gateway sends `x-caliban-intent` as `<intent>;confidence=<0..1>;stage=<rules|knn|keyword>`, plus `;knn=<reason>` when kNN routing was on but did not decide (`timeout`, `embed_error`, `unavailable`, `no_text`, `abstain_oos`, `abstain_confidence`, `abstain_margin`, `abstain_empty`). A request for a named model reports `pinned;confidence=1.000;stage=rules`.
+
+```python
+resp = client.chat.completions.create(model="caliban/auto", messages=msgs)
+if resp.caliban.cache == "hit":
+    print("served from the", resp.caliban.cache_tier, "cache")
+route = resp.caliban.intent  # IntentDecision(intent='translate', confidence=0.912, stage='knn')
+if route and route.knn_reason:
+    print("kNN fell back to", route.stage, "because of", route.knn_reason)
+```
+
+Parsing never raises. Unknown `key=value` fields are ignored, so a newer gateway can add fields. A value with no intent name, a missing or out-of-range `confidence`, or a missing or unknown `stage` gives `intent=None`; an unknown cache tier gives `cache_tier=None`. `IntentDecision.parse(value)` works on a raw header string.
 
 ### Reasoning models
 
@@ -247,7 +262,7 @@ print(admin.usage.get(tenant_id=t.id, limit=100).totals)
 
 | Resource | Methods |
 |---|---|
-| `tenants` | `list` (`include_deleted=`), `get`, `create`, `delete` |
+| `tenants` | `list` (`include_deleted=`), `get`, `create`, `update`, `delete` |
 | `api_keys` | `list` (`include_revoked=`), `create`, `revoke` |
 | `provider_keys` | `list`, `create`, `delete` |
 | `models` | `list`, `create`, `delete` |
@@ -257,7 +272,51 @@ print(admin.usage.get(tenant_id=t.id, limit=100).totals)
 | `nodes` | `list`, `create` (validates `spec` locally first; `validate_spec=False` skips that), `delete` |
 | `usage` | `get` (`limit` between 1 and 1000) |
 
-The constructor takes `token`, `base_url`, `timeout` (default 30 s), `max_retries`, `default_headers` and `http_client`. GET and DELETE requests retry on 429, 502 and 503. POST requests retry only on 429 and 503, because a 502 may mean the server already acted (see [Retries](#retries)). The response models live in `caliban.admin.models`.
+The constructor takes `token`, `base_url`, `timeout` (default 30 s), `max_retries`, `default_headers` and `http_client`. GET and DELETE requests retry on 429, 502 and 503. POST and PATCH requests retry only on 429 and 503, because a 502 may mean the server already acted (see [Retries](#retries)). The response models live in `caliban.admin.models`.
+
+#### Tenant settings
+
+`tenants.update(tenant_id, ...)` sends `PATCH /api/v1/tenants/{tenantId}` and returns the updated `Tenant`. Arguments you leave out keep their value. The change is audited as `tenant.update`, and split-mode routers apply it with their next snapshot. An unknown or deleted tenant raises `NotFoundError`. `tenants.create(...)` takes the same keyword arguments.
+
+| Argument | Values | Default | Meaning |
+|---|---|---|---|
+| `pii_default` | `"off"`, `"mask"`, `"reversible"` | `"reversible"` | PII mode for requests that do not set `caliban.pii`. |
+| `pii_surrogate_scope` | `"tenant"`, `"session"` | `"tenant"` | How reversible PII surrogates are chosen. |
+| `semantic_cache` | `"off"`, `"on"` | `"off"` | Whether the tenant's eligible requests may use the semantic cache. |
+
+```python
+admin.tenants.update(t.id, semantic_cache="on")
+t = admin.tenants.update(t.id, pii_surrogate_scope="session")
+print(t.pii_surrogate_scope, t.semantic_cache)  # session on
+```
+
+- **`pii_surrogate_scope="tenant"`** (the default): a given value always gets the same surrogate within the tenant (a keyed HMAC per tenant, derived from `CALIBAN_KEK`). That lets pseudonymised requests hit the exact cache. The trade-off is linkability: anyone who can see the pseudonymised traffic (an upstream provider, for example) can tell that two requests or sessions of the tenant mention the same person, even without learning who it is. Surrogates never cross tenants.
+- **`pii_surrogate_scope="session"`**: every request gets fresh surrogates, so requests cannot be linked through them. Requests that carry PII then bypass the exact and semantic caches.
+- **`semantic_cache="on"`**: an eligible request may be answered with the response to an earlier, semantically similar request of the same tenant (same model, system prompt, history and parameters). Entries never cross tenants. The deployment must also enable it (`[cache.semantic] enabled`). Hits report `x-caliban-cache: hit` with `x-caliban-cache-tier: semantic`.
+
+Both fields are `None` on tenants from an older server.
+
+#### Usage fields
+
+`usage.get()` returns a `UsageReport` with `events` (`UsageEvent`) and `totals` (`UsageTotals`). Beyond the request basics (`model`, tokens, `cache`, `cost_usd`, `latency_ms`, `ts`), an event can carry these optional fields. The server omits them when they do not apply, so they are `None` then, and on events from an older server.
+
+| Field | When present | Meaning |
+|---|---|---|
+| `cache_tier` | Cache hits | `"exact"` or `"semantic"`. `cache` stays `"hit"`, `"miss"` or `"bypass"`. |
+| `tokens_saved` | Cache hits | Tokens not sent upstream: the cached answer's prompt plus completion tokens. |
+| `requested_model` | Chat requests | The model the client asked for: `caliban/auto` or a pinned id. |
+| `intent_confidence` | Chat requests | Confidence of the intent decision, 0..1. |
+| `route_stage` | Chat requests | `"rules"`, `"knn"` or `"keyword"`. |
+| `routed_model_cost_usd` | `caliban/auto`, priced model | Real cost of the routed model for this request. |
+| `flat_price_usd` | `caliban/auto` | The flat auto price for the same tokens. `0` on a cache hit. |
+
+`totals` adds `semantic_cache_hits` (`cache_hits` counts both tiers), `auto_requests` (requests for `caliban/auto`), and `flat_price_usd`, `routed_model_cost_usd` and `margin_usd` (`flat_price_usd - routed_model_cost_usd`), summed over the `caliban/auto` events that carry both prices.
+
+```python
+totals = admin.usage.get(tenant_id=t.id).totals
+print(f"{totals.semantic_cache_hits or 0} of {totals.cache_hits or 0} hits were semantic")
+print(f"auto margin: ${totals.margin_usd or 0:.4f} over {totals.auto_requests or 0} requests")
+```
 
 **Deleting and revoking.** `tenants.delete(tenant_id)`, `api_keys.revoke(tenant_id, key_id)`, `datasources.delete(tenant_id, datasource_id)` and `nodes.delete(tenant_id, node_id)` return `None` on success (204). An unknown id, an id that belongs to another tenant, or one that is already deleted raises `NotFoundError`, so a repeated delete raises too.
 
@@ -487,7 +546,7 @@ All status errors derive from `APIStatusError`, which derives from `APIError`. C
 | Setting | Behaviour |
 |---|---|
 | `max_retries` | 2. Exponential backoff with jitter (0.5 s, 1 s, ... up to 8 s). `Retry-After` is honoured, capped at 60 s. |
-| Retried statuses | GET, HEAD, OPTIONS, PUT and DELETE: 429, 502, 503. POST (chat completions, embeddings, rerank, admin creates): 429 and 503 only. Both clients follow the same rules. |
+| Retried statuses | GET, HEAD, OPTIONS, PUT and DELETE: 429, 502, 503. POST (chat completions, embeddings, rerank, admin creates) and PATCH (`tenants.update`): 429 and 503 only. Both clients follow the same rules. |
 | Transport errors | Connect failures (`ConnectError`, `ConnectTimeout`) are always retried, since the request was never sent. Read timeouts and resets are retried only for idempotent requests, never for a POST. |
 | Streams | Retried only before the first byte reaches you. Once iteration has started, a failure raises and is never replayed. |
 

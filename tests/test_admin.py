@@ -419,3 +419,175 @@ def test_contract_mismatch_raises_typed_error(admin: CalibanAdmin) -> None:
     router(admin).get("/tenants").respond(200, json=[{"id": "t1"}])
     with pytest.raises(APIResponseValidationError, match="does not match the contract"):
         admin.tenants.list()
+
+
+def test_tenant_update_patches_only_given_fields(admin: CalibanAdmin) -> None:
+    updated = {**TENANT, "pii_surrogate_scope": "session", "semantic_cache": "on"}
+    route = router(admin).patch("/tenants/t1").respond(200, json=updated)
+    t = admin.tenants.update("t1", pii_surrogate_scope="session", semantic_cache="on")
+    req = route.calls.last.request
+    assert req.method == "PATCH"
+    assert req.headers["authorization"] == "Bearer adm"
+    assert req.headers["content-type"] == "application/json"
+    assert json.loads(req.content) == {"pii_surrogate_scope": "session", "semantic_cache": "on"}
+    assert (t.pii_surrogate_scope, t.semantic_cache) == ("session", "on")
+
+    admin.tenants.update("t1", pii_default="mask")
+    assert json.loads(route.calls.last.request.content) == {"pii_default": "mask"}
+
+
+def test_tenant_update_escapes_path_and_rejects_bad_values() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=TENANT)
+
+    client = CalibanAdmin(
+        token="adm",
+        base_url="http://cp.test:8081",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    client.tenants.update("t/1", semantic_cache="off")
+    assert seen[0].url.raw_path == b"/api/v1/tenants/t%2F1"
+    with pytest.raises(ValueError, match="semantic_cache"):
+        client.tenants.update("t1", semantic_cache="yes")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="extra"):
+        m.TenantUpdate(name="x")  # type: ignore[call-arg]
+    assert len(seen) == 1
+
+
+def test_tenant_update_not_found(admin: CalibanAdmin) -> None:
+    route = (
+        router(admin)
+        .patch("/tenants/gone")
+        .respond(404, json={"error": {"message": "nope", "type": "not_found", "code": None}})
+    )
+    with pytest.raises(NotFoundError):
+        admin.tenants.update("gone", semantic_cache="on")
+    assert route.call_count == 1
+
+
+def test_tenant_update_retry_policy(admin: CalibanAdmin) -> None:
+    # PATCH is treated like POST: retried on 429/503, never on 502 (each call is audited).
+    retried = (
+        router(admin)
+        .patch("/tenants/t1")
+        .mock(side_effect=[httpx.Response(503), httpx.Response(200, json=TENANT)])
+    )
+    admin.tenants.update("t1", semantic_cache="off")
+    assert retried.call_count == 2
+    assert retried.calls[0].request.content == retried.calls[1].request.content
+    bad = (
+        router(admin)
+        .patch("/tenants/t2")
+        .mock(
+            side_effect=[
+                httpx.Response(502, json={"error": {"message": "u", "type": "upstream_error"}}),
+                httpx.Response(200, json=TENANT),
+            ]
+        )
+    )
+    with pytest.raises(UpstreamError):
+        admin.tenants.update("t2", semantic_cache="off")
+    assert bad.call_count == 1
+
+
+def test_tenant_settings_on_create_and_older_servers(admin: CalibanAdmin) -> None:
+    r = router(admin)
+    create = r.post("/tenants").respond(
+        201, json={**TENANT, "pii_surrogate_scope": "tenant", "semantic_cache": "off"}
+    )
+    r.get("/tenants").respond(200, json=[TENANT])
+    t = admin.tenants.create(name="Acme", pii_surrogate_scope="tenant", semantic_cache="off")
+    assert json.loads(create.calls.last.request.content) == {
+        "name": "Acme",
+        "pii_surrogate_scope": "tenant",
+        "semantic_cache": "off",
+    }
+    assert (t.pii_surrogate_scope, t.semantic_cache) == ("tenant", "off")
+    older = admin.tenants.list()[0]
+    assert older.pii_surrogate_scope is None and older.semantic_cache is None
+
+
+USAGE_BASE = {
+    "request_id": "r1",
+    "tenant_id": "t1",
+    "model": "local/qwen3-8b",
+    "prompt_tokens": 12,
+    "completion_tokens": 7,
+    "cache": "miss",
+    "latency_ms": 40,
+    "ts": TS,
+}
+USAGE_AUTO_HIT = {
+    **USAGE_BASE,
+    "request_id": "r2",
+    "cache": "hit",
+    "cache_tier": "semantic",
+    "tokens_saved": 19,
+    "intent": "translate",
+    "requested_model": "caliban/auto",
+    "intent_confidence": 0.912,
+    "route_stage": "knn",
+    "routed_model_cost_usd": 0.000026,
+    "flat_price_usd": 0.00026,
+}
+USAGE_TOTALS = {
+    "requests": 2,
+    "prompt_tokens": 24,
+    "completion_tokens": 14,
+    "cache_hits": 1,
+    "semantic_cache_hits": 1,
+    "tokens_saved": 19,
+    "cost_usd": 0.000026,
+    "auto_requests": 1,
+    "flat_price_usd": 0.00026,
+    "routed_model_cost_usd": 0.000026,
+    "margin_usd": 0.000234,
+}
+
+
+def test_usage_new_event_fields_and_totals(admin: CalibanAdmin) -> None:
+    router(admin).get("/usage").respond(
+        200, json={"events": [USAGE_BASE, USAGE_AUTO_HIT], "totals": USAGE_TOTALS}
+    )
+    rep = admin.usage.get(tenant_id="t1")
+    plain, auto = rep.events
+    assert plain.cache == "miss"
+    assert plain.cache_tier is None and plain.requested_model is None
+    assert plain.intent_confidence is None and plain.route_stage is None
+    assert plain.routed_model_cost_usd is None and plain.flat_price_usd is None
+    assert (auto.cache, auto.cache_tier, auto.tokens_saved) == ("hit", "semantic", 19)
+    assert (auto.requested_model, auto.intent_confidence, auto.route_stage) == (
+        "caliban/auto",
+        0.912,
+        "knn",
+    )
+    assert (auto.routed_model_cost_usd, auto.flat_price_usd) == (0.000026, 0.00026)
+    totals = rep.totals
+    assert totals.model_dump(exclude_none=True) == USAGE_TOTALS
+    assert totals.semantic_cache_hits == 1 and totals.auto_requests == 1
+    assert totals.flat_price_usd is not None and totals.routed_model_cost_usd is not None
+    assert totals.margin_usd == pytest.approx(totals.flat_price_usd - totals.routed_model_cost_usd)
+
+
+def test_usage_from_older_server_without_new_fields(admin: CalibanAdmin) -> None:
+    router(admin).get("/usage").respond(
+        200, json={"events": [USAGE_BASE], "totals": {"requests": 1, "cache_hits": 0}}
+    )
+    rep = admin.usage.get()
+    assert rep.events[0].cache_tier is None
+    totals = rep.totals
+    assert (totals.requests, totals.cache_hits) == (1, 0)
+    assert totals.semantic_cache_hits is None and totals.auto_requests is None
+    assert totals.flat_price_usd is None and totals.margin_usd is None
+
+
+def test_usage_cache_enum_unchanged(admin: CalibanAdmin) -> None:
+    # `cache` stays hit/miss/bypass; the tier lives in `cache_tier`.
+    router(admin).get("/usage").respond(
+        200, json={"events": [{**USAGE_BASE, "cache": "semantic"}], "totals": {}}
+    )
+    with pytest.raises(APIResponseValidationError):
+        admin.usage.get()

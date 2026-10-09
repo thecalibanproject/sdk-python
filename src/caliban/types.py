@@ -7,14 +7,16 @@ future Caliban versions survive a round-trip.
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Mapping
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
 __all__ = [
     "CacheMode",
     "CacheStatus",
+    "CacheTier",
     "CalibanOptions",
     "CalibanResponseMeta",
     "ChatCompletion",
@@ -27,6 +29,7 @@ __all__ = [
     "CreateEmbeddingResponse",
     "Embedding",
     "EmbeddingUsage",
+    "IntentDecision",
     "Model",
     "ModelCalibanInfo",
     "ModelCapabilities",
@@ -39,12 +42,17 @@ __all__ = [
     "RerankResult",
     "RerankUsage",
     "Role",
+    "RouteStage",
     "TrustTier",
 ]
 
 PiiMode = Literal["off", "mask", "reversible"]
 CacheMode = Literal["off", "exact", "semantic"]
 CacheStatus = Literal["hit", "miss", "bypass"]
+CacheTier = Literal["exact", "semantic"]
+"""Which cache tier answered a hit (``x-caliban-cache-tier``, ``UsageEvent.cache_tier``)."""
+RouteStage = Literal["rules", "knn", "keyword"]
+"""Routing stage that decided the intent: ``rules`` (pinned model), ``knn`` or ``keyword``."""
 Role = Literal["system", "developer", "user", "assistant", "tool"]
 ReasoningEffort = Literal["off", "low", "medium", "high"]
 """``caliban.reasoning``. Mapped per model family (Qwen3 ``enable_thinking``,
@@ -116,12 +124,84 @@ class CompletionUsage(BaseModel):
     total_tokens: int | None = None
 
 
+_CACHE_TIERS: frozenset[str] = frozenset(("exact", "semantic"))
+_ROUTE_STAGES: frozenset[str] = frozenset(("rules", "knn", "keyword"))
+_DECIMAL = re.compile(r"(?:\d+(?:\.\d*)?|\.\d+)")
+
+
+class IntentDecision(BaseModel):
+    """The routing decision from ``x-caliban-intent``.
+
+    The gateway sends ``<intent>;confidence=<0..1>;stage=<rules|knn|keyword>``, plus
+    ``;knn=<reason>`` when kNN routing was on but did not decide.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    intent: str
+    """Intent name, e.g. ``translate``; ``pinned`` when the client named a model."""
+    confidence: float
+    """Confidence of the decision, 0..1."""
+    stage: RouteStage
+    knn_reason: str | None = None
+    """Why kNN did not decide although it was on (``timeout``, ``embed_error``,
+    ``unavailable``, ``no_text``, ``abstain_oos``, ``abstain_confidence``,
+    ``abstain_margin``, ``abstain_empty``, or a newer reason). ``None`` otherwise."""
+
+    @classmethod
+    def parse(cls, value: str | None) -> IntentDecision | None:
+        """Parse an ``x-caliban-intent`` value. Never raises.
+
+        Unknown ``key=value`` fields are ignored. Returns ``None`` for an absent value or a
+        malformed one: no intent name, a missing or out-of-range ``confidence``, or a
+        missing or unknown ``stage``.
+        """
+        if value is None:
+            return None
+        head, *rest = value.strip().split(";")
+        intent = head.strip()
+        if not intent or "=" in intent:
+            return None
+        fields: dict[str, str] = {}
+        for part in rest:
+            key, eq, val = part.partition("=")
+            key = key.strip().lower()
+            if eq and key and key not in fields:
+                fields[key] = val.strip()
+        conf_raw = fields.get("confidence", "")
+        if not _DECIMAL.fullmatch(conf_raw):
+            return None
+        confidence = float(conf_raw)
+        if not 0.0 <= confidence <= 1.0:
+            return None
+        stage = fields.get("stage", "").lower()
+        if stage not in _ROUTE_STAGES:
+            return None
+        return cls(
+            intent=intent,
+            confidence=confidence,
+            stage=cast(RouteStage, stage),
+            knn_reason=fields.get("knn") or None,
+        )
+
+
+def _cache_tier(value: str | None) -> CacheTier | None:
+    v = (value or "").strip().lower()
+    return cast(CacheTier, v) if v in _CACHE_TIERS else None
+
+
 class CalibanResponseMeta(BaseModel):
     """Metadata Caliban returns in ``x-caliban-*`` response headers."""
 
     request_id: str | None = None
     routed_model: str | None = None
     cache: CacheStatus | str | None = None
+    """``x-caliban-cache``: ``hit`` (either cache tier), ``miss`` or ``bypass``."""
+    cache_tier: CacheTier | None = None
+    """``x-caliban-cache-tier``: ``exact`` or ``semantic``, sent on hits only. ``None`` when
+    absent or not one of those values."""
+    intent: IntentDecision | None = None
+    """``x-caliban-intent``, parsed. ``None`` when absent or malformed."""
     pii_entities: int | None = None
     cost_usd: float | None = None
     """``x-caliban-cost-usd``: cost of the request in USD. Sent on non-streaming responses
@@ -136,6 +216,8 @@ class CalibanResponseMeta(BaseModel):
             request_id=cal.get("x-caliban-request-id"),
             routed_model=cal.get("x-caliban-routed-model"),
             cache=cal.get("x-caliban-cache"),
+            cache_tier=_cache_tier(cal.get("x-caliban-cache-tier")),
+            intent=IntentDecision.parse(cal.get("x-caliban-intent")),
             pii_entities=_to_int(cal.get("x-caliban-pii-entities")),
             cost_usd=_to_float(cal.get("x-caliban-cost-usd")),
             headers=cal,
