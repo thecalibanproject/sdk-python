@@ -247,17 +247,35 @@ print(admin.usage.get(tenant_id=t.id, limit=100).totals)
 
 | Resource | Methods |
 |---|---|
-| `tenants` | `list`, `get`, `create` |
-| `api_keys` | `list`, `create` |
+| `tenants` | `list` (`include_deleted=`), `get`, `create`, `delete` |
+| `api_keys` | `list` (`include_revoked=`), `create`, `revoke` |
 | `provider_keys` | `list`, `create`, `delete` |
 | `models` | `list`, `create`, `delete` |
 | `providers` | `list`, `create`, `delete`, `health`, `discover` |
-| `datasources` | `list`, `create`, `introspect` |
+| `datasources` | `list`, `create`, `delete`, `introspect` |
 | `ontology` | `get`, `review`, `approve`, `reject` |
-| `nodes` | `list`, `create` (validates `spec` locally first; `validate_spec=False` skips that) |
+| `nodes` | `list`, `create` (validates `spec` locally first; `validate_spec=False` skips that), `delete` |
 | `usage` | `get` (`limit` between 1 and 1000) |
 
-The constructor takes `token`, `base_url`, `timeout` (default 30 s), `max_retries`, `default_headers` and `http_client`. GET and DELETE requests retry on 429, 502 and 503. POST requests retry only on 429 and 503, because a 502 may mean the server already acted. The response models live in `caliban.admin.models`.
+The constructor takes `token`, `base_url`, `timeout` (default 30 s), `max_retries`, `default_headers` and `http_client`. GET and DELETE requests retry on 429, 502 and 503. POST requests retry only on 429 and 503, because a 502 may mean the server already acted (see [Retries](#retries)). The response models live in `caliban.admin.models`.
+
+**Deleting and revoking.** `tenants.delete(tenant_id)`, `api_keys.revoke(tenant_id, key_id)`, `datasources.delete(tenant_id, datasource_id)` and `nodes.delete(tenant_id, node_id)` return `None` on success (204). An unknown id, an id that belongs to another tenant, or one that is already deleted raises `NotFoundError`, so a repeated delete raises too.
+
+```python
+# Revoke a leaked key, then retire the whole tenant.
+admin.api_keys.revoke(t.id, key.id)
+admin.tenants.delete(t.id)  # revokes keys, wipes BYOK credentials, removes routes,
+                            # soft-deletes datasources and nodes
+
+# Deleted tenants and revoked keys are hidden unless you ask for them.
+tombstones = [x for x in admin.tenants.list(include_deleted=True) if x.status == "deleted"]
+revoked = [k for k in admin.api_keys.list(other_id, include_revoked=True) if k.revoked_at]
+```
+
+- Deletes are permanent. The server keeps the rows for audit, but nothing can be restored, and secrets they held (BYOK credentials, datasource connection settings) are destroyed.
+- A deleted tenant's id cannot be reused, and every tenant-scoped call for it raises `NotFoundError`.
+- A standalone deployment rejects a revoked key on the next request. A split-mode router stops accepting it after its next snapshot poll (`CALIBAN_SNAPSHOT_POLL_SECS`, 10 s by default).
+- `Tenant` has `status` (`"active"` or `"deleted"`) and `deleted_at`; `ApiKeyInfo` has `revoked_at`. They are optional and `None` when an older server omits them.
 
 ### Open models on-prem
 
@@ -469,11 +487,13 @@ All status errors derive from `APIStatusError`, which derives from `APIError`. C
 | Setting | Behaviour |
 |---|---|
 | `max_retries` | 2. Exponential backoff with jitter (0.5 s, 1 s, ... up to 8 s). `Retry-After` is honoured, capped at 60 s. |
-| Retried statuses | 429, 502, 503 on the data plane. (The admin client skips 502 for POST, see above.) |
-| Transport errors | Connect failures are always retried. Read timeouts and resets are retried only for idempotent requests (GET, DELETE), never for `POST /chat/completions`. |
+| Retried statuses | GET, HEAD, OPTIONS, PUT and DELETE: 429, 502, 503. POST (chat completions, embeddings, rerank, admin creates): 429 and 503 only. Both clients follow the same rules. |
+| Transport errors | Connect failures (`ConnectError`, `ConnectTimeout`) are always retried, since the request was never sent. Read timeouts and resets are retried only for idempotent requests, never for a POST. |
 | Streams | Retried only before the first byte reaches you. Once iteration has started, a failure raises and is never replayed. |
 
-Data-plane POSTs, including chat completions, are retried on 502. The gateway does not support idempotency keys yet, so if a duplicate upstream call would matter, pass `max_retries=0` and handle `UpstreamError` yourself.
+A POST is never retried on 500, 502 or 504, because the gateway may already have run the request and billed it upstream.
+
+To make a POST retryable like a GET (502, read timeouts and resets included), send an `Idempotency-Key` header, for example `create(..., extra_headers={"Idempotency-Key": key})`. The admin client has no per-call headers, so there it can only come from `default_headers`. The SDK never sends the header on its own. The gateway does not deduplicate on this key yet, so a retry after a 502 can still run the request twice upstream; use a key only when that is acceptable, and a fresh one per logical request.
 
 ### Timeouts
 

@@ -13,7 +13,6 @@ from pydantic import BaseModel, TypeAdapter
 
 from .._base import (
     DEFAULT_MAX_RETRIES,
-    DEFAULT_RETRY_STATUSES,
     SyncHTTP,
     TimeoutTypes,
     parse_response,
@@ -57,9 +56,6 @@ __all__ = ["DEFAULT_ADMIN_URL", "CalibanAdmin"]
 DEFAULT_ADMIN_URL = "http://localhost:8081"
 API_PREFIX = "/api/v1"
 
-# POSTs are not idempotent: never retry them on 502 (the upstream may have acted).
-_POST_RETRY: frozenset[int] = frozenset({429, 503})
-
 M = TypeVar("M", bound=BaseModel)
 
 
@@ -90,12 +86,11 @@ class _Resource:
         return self._admin._http.request("GET", path, params=params)
 
     def _post(self, path: str, body: Any = None) -> httpx.Response:
-        return self._admin._http.request(
-            "POST", path, json=body, retry_statuses=_POST_RETRY, idempotent=False
-        )
+        # Not idempotent: retried on 429/503 only, never 502 (the server may have acted).
+        return self._admin._http.request("POST", path, json=body)
 
     def _delete(self, path: str) -> httpx.Response:
-        return self._admin._http.request("DELETE", path, retry_statuses=DEFAULT_RETRY_STATUSES)
+        return self._admin._http.request("DELETE", path)
 
     @staticmethod
     def _one(model: type[M], resp: httpx.Response) -> M:
@@ -107,11 +102,23 @@ class _Resource:
 
 
 class Tenants(_Resource):
-    def list(self) -> list[Tenant]:
-        return self._many(Tenant, self._get("tenants"))
+    def list(self, *, include_deleted: bool | None = None) -> list[Tenant]:
+        """Active tenants; ``include_deleted=True`` also returns tombstones."""
+        return self._many(Tenant, self._get("tenants", {"include_deleted": include_deleted}))
 
     def get(self, tenant_id: str) -> Tenant:
+        """Raises :class:`~caliban.NotFoundError` for an unknown or deleted tenant."""
         return self._one(Tenant, self._get(f"tenants/{_p(tenant_id)}"))
+
+    def delete(self, tenant_id: str) -> None:
+        """Permanently delete a tenant.
+
+        In one audited transaction the server turns it into a tombstone, revokes its API
+        keys, destroys its BYOK credentials, removes its routes and soft-deletes its
+        datasources and nodes. The id cannot be reused. Raises
+        :class:`~caliban.NotFoundError` if the tenant is unknown or already deleted.
+        """
+        self._delete(f"tenants/{_p(tenant_id)}")
 
     def create(
         self, *, name: str, region: str | None = None, pii_default: PiiMode | None = None
@@ -123,13 +130,27 @@ class Tenants(_Resource):
 class ApiKeys(_Resource):
     """Tenant Caliban API keys (``cal_...``). Only metadata is listable."""
 
-    def list(self, tenant_id: str) -> list[ApiKeyInfo]:
-        return self._many(ApiKeyInfo, self._get(f"tenants/{_p(tenant_id)}/api-keys"))
+    def list(self, tenant_id: str, *, include_revoked: bool | None = None) -> list[ApiKeyInfo]:
+        """Active keys; ``include_revoked=True`` also returns revoked ones."""
+        return self._many(
+            ApiKeyInfo,
+            self._get(f"tenants/{_p(tenant_id)}/api-keys", {"include_revoked": include_revoked}),
+        )
 
     def create(self, tenant_id: str, *, name: str | None = None) -> ApiKeyCreated:
         """Mint a key. ``result.key`` holds the plaintext and is shown exactly once."""
         body = ApiKeyCreate(name=name).to_body()
         return self._one(ApiKeyCreated, self._post(f"tenants/{_p(tenant_id)}/api-keys", body))
+
+    def revoke(self, tenant_id: str, key_id: str) -> None:
+        """Revoke a key (permanent).
+
+        A standalone deployment rejects it on the next request; a split-mode router
+        rejects it after its next snapshot poll (10 s by default). Raises
+        :class:`~caliban.NotFoundError` if the key is unknown, belongs to another tenant
+        or is already revoked.
+        """
+        self._delete(f"tenants/{_p(tenant_id)}/api-keys/{_p(key_id)}")
 
 
 class ProviderKeys(_Resource):
@@ -292,6 +313,15 @@ class Datasources(_Resource):
         ).to_body()
         return self._one(Datasource, self._post("datasources", body))
 
+    def delete(self, tenant_id: str, datasource_id: str) -> None:
+        """Permanently delete a datasource of ``tenant_id``.
+
+        Its stored connection settings are wiped and its name can be used again. Raises
+        :class:`~caliban.NotFoundError` if it is unknown, belongs to another tenant or is
+        already deleted.
+        """
+        self._delete(f"tenants/{_p(tenant_id)}/datasources/{_p(datasource_id)}")
+
     def introspect(self, datasource_id: str) -> IntrospectJob:
         """Start an ontology bootstrap job; proposed elements land with status=proposed."""
         return self._one(IntrospectJob, self._post(f"datasources/{_p(datasource_id)}/introspect"))
@@ -346,6 +376,13 @@ class Nodes(_Resource):
         body = NodeCreate(tenant_id=tenant_id, name=name, spec=spec_body).to_body()
         return self._one(Node, self._post("nodes", body))
 
+    def delete(self, tenant_id: str, node_id: str) -> None:
+        """Permanently delete one node version of ``tenant_id``; its version number is not
+        reused. Raises :class:`~caliban.NotFoundError` if it is unknown, belongs to another
+        tenant or is already deleted.
+        """
+        self._delete(f"tenants/{_p(tenant_id)}/nodes/{_p(node_id)}")
+
 
 class Usage(_Resource):
     def get(self, *, tenant_id: str | None = None, limit: int = 100) -> UsageReport:
@@ -362,7 +399,8 @@ class CalibanAdmin:
         base_url: Control-plane origin, e.g. ``http://localhost:8081`` (a trailing
             ``/api/v1`` is accepted). Defaults to ``$CALIBAN_ADMIN_URL``.
 
-    Retries: GET/DELETE retry on 429/502/503; POST retries only on 429/503.
+    Retries: GET/DELETE retry on 429/502/503; POST retries only on 429/503, unless an
+    ``Idempotency-Key`` header is set (for example via ``default_headers``).
     """
 
     def __init__(

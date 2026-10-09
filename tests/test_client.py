@@ -196,7 +196,7 @@ def _sequence(*responses: httpx.Response) -> tuple[list[httpx.Request], object]:
     return calls, handler
 
 
-@pytest.mark.parametrize("status", [429, 502, 503])
+@pytest.mark.parametrize("status", [429, 503])
 def test_retries_retryable_status_then_succeeds(status: int, no_sleep: list[float]) -> None:
     calls, handler = _sequence(
         httpx.Response(status, json=error_body("x", "y")),
@@ -209,12 +209,85 @@ def test_retries_retryable_status_then_succeeds(status: int, no_sleep: list[floa
 
 
 def test_retry_after_header_honoured(no_sleep: list[float]) -> None:
-    _, handler = _sequence(
+    calls, handler = _sequence(
         httpx.Response(429, json=error_body("x", "rate_limited"), headers={"retry-after": "2"}),
         httpx.Response(200, json=completion_body()),
     )
     make_client(handler).chat.completions.create(model="m", messages=[])  # type: ignore[arg-type]
+    assert len(calls) == 2 and calls[0].method == "POST"
     assert no_sleep == [2.0]
+
+
+@pytest.mark.parametrize("status", [500, 502, 504])
+def test_post_not_retried_after_upstream_may_have_run(status: int) -> None:
+    calls, handler = _sequence(
+        httpx.Response(status, json=error_body("x", "upstream_error")),
+        httpx.Response(200, json=completion_body()),
+    )
+    with pytest.raises(InternalServerError):
+        make_client(handler).chat.completions.create(model="m", messages=[])  # type: ignore[arg-type]
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("call", ["embeddings", "rerank"])
+def test_other_data_plane_posts_not_retried_on_502(call: str) -> None:
+    calls, handler = _sequence(
+        httpx.Response(502, json=error_body("x", "upstream_error")),
+        httpx.Response(200, json={}),
+    )
+    client = make_client(handler)  # type: ignore[arg-type]
+
+    def send() -> object:
+        if call == "embeddings":
+            return client.embeddings.create(model="e", input="hi")
+        return client.rerank.create(model="r", query="q", documents=["d"])
+
+    with pytest.raises(UpstreamError):
+        send()
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("status", [429, 502, 503])
+def test_get_retried_on_retryable_status(status: int) -> None:
+    calls, handler = _sequence(
+        httpx.Response(status, json=error_body("x", "y")),
+        httpx.Response(200, json={"object": "list", "data": []}),
+    )
+    assert make_client(handler).models.list().data == []  # type: ignore[arg-type]
+    assert [c.method for c in calls] == ["GET", "GET"]
+
+
+def test_post_with_idempotency_key_retried_on_502() -> None:
+    calls, handler = _sequence(
+        httpx.Response(502, json=error_body("x", "upstream_error")),
+        httpx.Response(200, json=completion_body("ok")),
+    )
+    out = make_client(handler).chat.completions.create(  # type: ignore[arg-type]
+        model="m", messages=[], extra_headers={"idempotency-key": "req-1"}
+    )
+    assert out.text == "ok"
+    assert [c.headers["Idempotency-Key"] for c in calls] == ["req-1", "req-1"]
+
+
+def test_post_with_idempotency_key_retried_after_read_timeout() -> None:
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if len(calls) == 1:
+            raise httpx.ReadTimeout("slow", request=request)
+        return httpx.Response(200, json=completion_body())
+
+    make_client(handler).chat.completions.create(
+        model="m", messages=[], extra_headers={"Idempotency-Key": "req-2"}
+    )
+    assert len(calls) == 2
+
+
+def test_no_idempotency_key_sent_by_default() -> None:
+    calls, handler = _sequence(httpx.Response(200, json=completion_body()))
+    make_client(handler).chat.completions.create(model="m", messages=[])  # type: ignore[arg-type]
+    assert "idempotency-key" not in calls[0].headers
 
 
 def test_retries_exhausted(no_sleep: list[float]) -> None:
@@ -230,7 +303,7 @@ def test_retries_exhausted(no_sleep: list[float]) -> None:
     assert no_sleep == sorted(no_sleep)  # exponential backoff grows
 
 
-@pytest.mark.parametrize("status", [400, 401, 403, 404, 500])
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 500, 502, 504])
 def test_non_retryable_status_not_retried(status: int) -> None:
     calls: list[httpx.Request] = []
 
@@ -263,6 +336,22 @@ def test_read_timeout_not_retried_for_post() -> None:
         raise httpx.ReadTimeout("slow", request=request)
 
     with pytest.raises(APITimeoutError):
+        make_client(handler).chat.completions.create(model="m", messages=[])
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [httpx.ReadError("connection reset"), httpx.RemoteProtocolError("server disconnected")],
+)
+def test_connection_error_after_send_not_retried_for_post(exc: httpx.TransportError) -> None:
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        raise exc
+
+    with pytest.raises(APIConnectionError):
         make_client(handler).chat.completions.create(model="m", messages=[])
     assert len(calls) == 1
 
@@ -361,7 +450,7 @@ def test_async_create_retry_and_headers(no_sleep: list[float]) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append(request)
         if len(calls) == 1:
-            return httpx.Response(502, json=error_body("x", "upstream_error"))
+            return httpx.Response(503, json=error_body("x", "unavailable"))
         return httpx.Response(200, json=completion_body("async"), headers=HEADERS)
 
     async def run() -> caliban.ChatCompletion:
@@ -375,6 +464,29 @@ def test_async_create_retry_and_headers(no_sleep: list[float]) -> None:
     assert resp.caliban.routed_model == "llama-3.1-8b"
     assert len(calls) == 2 and len(no_sleep) == 1
     assert json.loads(calls[1].content)["caliban"] == {"node": "n"}
+
+
+def test_async_post_not_retried_on_502_unless_idempotency_key() -> None:
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if len(calls) % 2 == 1:
+            return httpx.Response(502, json=error_body("x", "upstream_error"))
+        return httpx.Response(200, json=completion_body())
+
+    async def run() -> None:
+        async with make_async_client(handler) as client:
+            with pytest.raises(UpstreamError):
+                await client.chat.completions.create(model="m", messages=[])
+            assert len(calls) == 1
+            calls.clear()
+            await client.chat.completions.create(
+                model="m", messages=[], extra_headers={"Idempotency-Key": "k"}
+            )
+            assert len(calls) == 2
+
+    asyncio.run(run())
 
 
 def test_async_errors_and_models() -> None:

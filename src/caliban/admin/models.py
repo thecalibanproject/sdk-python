@@ -46,6 +46,7 @@ __all__ = [
     "SharedProviderCreate",
     "Tenant",
     "TenantCreate",
+    "TenantStatus",
     "TrustTier",
     "UsageEvent",
     "UsageReport",
@@ -53,6 +54,7 @@ __all__ = [
 ]
 
 PiiMode = Literal["off", "mask", "reversible"]
+TenantStatus = Literal["active", "deleted"]
 ProviderKind = Literal[
     "openai", "anthropic", "openai_compatible", "azure_openai", "bedrock", "vertex"
 ]
@@ -108,6 +110,9 @@ class Tenant(_Response):
     region: str | None = None
     pii_default: PiiMode | None = None
     created_at: datetime
+    status: TenantStatus | None = None
+    """``"deleted"`` only appears with ``include_deleted=True``. ``None`` from older servers."""
+    deleted_at: datetime | None = None
 
 
 class TenantCreate(_Request):
@@ -121,6 +126,8 @@ class ApiKeyInfo(_Response):
     name: str
     prefix: str
     created_at: datetime
+    revoked_at: datetime | None = None
+    """Set once the key is revoked (listed only with ``include_revoked=True``)."""
 
 
 class ApiKeyCreated(ApiKeyInfo):

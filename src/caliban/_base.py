@@ -4,11 +4,16 @@ Retry policy
 ------------
 * Retries happen only *before* a response body is handed to the caller. A stream
   that has started yielding chunks is never retried.
-* Retryable statuses default to 429, 502 and 503. ``Retry-After`` (seconds or an
-  HTTP date) is honoured, capped at :data:`MAX_RETRY_AFTER`.
+* Idempotent requests (GET, HEAD, OPTIONS, PUT, DELETE, or any request with an
+  ``Idempotency-Key`` header) retry on 429, 502 and 503. Other POSTs retry only on
+  429 and 503: after a 500, 502 or 504 the upstream may already have executed (and
+  billed) the request. ``Retry-After`` (seconds or an HTTP date) is honoured, capped
+  at :data:`MAX_RETRY_AFTER`.
 * Connection failures where the request provably never reached the server
   (``ConnectError``/``ConnectTimeout``) are always retryable. Other transport
   errors (read timeouts, resets) are retried only for idempotent requests.
+* The gateway does not deduplicate on ``Idempotency-Key`` yet. The header is sent
+  only when the caller sets it.
 """
 
 from __future__ import annotations
@@ -36,6 +41,10 @@ from .errors import (
 DEFAULT_TIMEOUT = httpx.Timeout(600.0, connect=10.0)
 DEFAULT_MAX_RETRIES = 2
 DEFAULT_RETRY_STATUSES: frozenset[int] = frozenset({429, 502, 503})
+# Non-idempotent POSTs: never retry 500/502/504, the upstream may have acted.
+NON_IDEMPOTENT_RETRY_STATUSES: frozenset[int] = frozenset({429, 503})
+IDEMPOTENT_METHODS: frozenset[str] = frozenset({"GET", "HEAD", "OPTIONS", "PUT", "DELETE"})
+IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
 INITIAL_BACKOFF = 0.5
 MAX_BACKOFF = 8.0
 MAX_RETRY_AFTER = 60.0
@@ -156,6 +165,24 @@ class _HTTPBase:
         )
 
     @staticmethod
+    def _retry_plan(
+        req: httpx.Request,
+        retry_statuses: frozenset[int] | None,
+        idempotent: bool | None,
+    ) -> tuple[frozenset[int], bool]:
+        """Resolve ``(statuses, idempotent)`` for a request.
+
+        An ``Idempotency-Key`` header makes any request idempotent. An explicit
+        ``retry_statuses`` is used as-is; otherwise it follows idempotency.
+        """
+        if idempotent is None:
+            idempotent = req.method.upper() in IDEMPOTENT_METHODS
+        idempotent = idempotent or IDEMPOTENCY_KEY_HEADER in req.headers
+        if retry_statuses is None:
+            retry_statuses = DEFAULT_RETRY_STATUSES if idempotent else NON_IDEMPOTENT_RETRY_STATUSES
+        return retry_statuses, idempotent
+
+    @staticmethod
     def _retryable_transport_error(exc: httpx.TransportError, idempotent: bool) -> bool:
         if isinstance(exc, httpx.ConnectError | httpx.ConnectTimeout):
             return True
@@ -203,12 +230,14 @@ class SyncHTTP(_HTTPBase):
         headers: Mapping[str, str] | None = None,
         timeout: TimeoutTypes = None,
         stream: bool = False,
-        retry_statuses: frozenset[int] = DEFAULT_RETRY_STATUSES,
+        retry_statuses: frozenset[int] | None = None,
         idempotent: bool | None = None,
     ) -> httpx.Response:
-        """Send with retries. Returns a 2xx response (open, unread if ``stream``)."""
-        if idempotent is None:
-            idempotent = method.upper() in {"GET", "HEAD", "OPTIONS", "DELETE", "PUT"}
+        """Send with retries. Returns a 2xx response (open, unread if ``stream``).
+
+        ``retry_statuses=None`` picks the default for the request's idempotency (see the
+        module docstring); an explicit set is honoured as-is.
+        """
         attempt = 0
         while True:
             req = self._build(
@@ -221,10 +250,11 @@ class SyncHTTP(_HTTPBase):
                 timeout=timeout,
                 stream=stream,
             )
+            statuses, safe = self._retry_plan(req, retry_statuses, idempotent)
             try:
                 resp = self.client.send(req, stream=True)
             except httpx.TransportError as exc:
-                if attempt < self.max_retries and self._retryable_transport_error(exc, idempotent):
+                if attempt < self.max_retries and self._retryable_transport_error(exc, safe):
                     _sleep(backoff_delay(attempt))
                     attempt += 1
                     continue
@@ -246,7 +276,7 @@ class SyncHTTP(_HTTPBase):
                 body = b""
             finally:
                 resp.close()
-            if resp.status_code in retry_statuses and attempt < self.max_retries:
+            if resp.status_code in statuses and attempt < self.max_retries:
                 _sleep(backoff_delay(attempt, resp.headers.get("retry-after")))
                 attempt += 1
                 continue
@@ -288,11 +318,9 @@ class AsyncHTTP(_HTTPBase):
         headers: Mapping[str, str] | None = None,
         timeout: TimeoutTypes = None,
         stream: bool = False,
-        retry_statuses: frozenset[int] = DEFAULT_RETRY_STATUSES,
+        retry_statuses: frozenset[int] | None = None,
         idempotent: bool | None = None,
     ) -> httpx.Response:
-        if idempotent is None:
-            idempotent = method.upper() in {"GET", "HEAD", "OPTIONS", "DELETE", "PUT"}
         attempt = 0
         while True:
             req = self._build(
@@ -305,10 +333,11 @@ class AsyncHTTP(_HTTPBase):
                 timeout=timeout,
                 stream=stream,
             )
+            statuses, safe = self._retry_plan(req, retry_statuses, idempotent)
             try:
                 resp = await self.client.send(req, stream=True)
             except httpx.TransportError as exc:
-                if attempt < self.max_retries and self._retryable_transport_error(exc, idempotent):
+                if attempt < self.max_retries and self._retryable_transport_error(exc, safe):
                     await _async_sleep(backoff_delay(attempt))
                     attempt += 1
                     continue
@@ -330,7 +359,7 @@ class AsyncHTTP(_HTTPBase):
                 body = b""
             finally:
                 await resp.aclose()
-            if resp.status_code in retry_statuses and attempt < self.max_retries:
+            if resp.status_code in statuses and attempt < self.max_retries:
                 await _async_sleep(backoff_delay(attempt, resp.headers.get("retry-after")))
                 attempt += 1
                 continue

@@ -12,7 +12,6 @@ from pydantic import BaseModel, TypeAdapter
 
 from ._base import (
     DEFAULT_MAX_RETRIES,
-    DEFAULT_RETRY_STATUSES,
     AsyncHTTP,
     SyncHTTP,
     TimeoutTypes,
@@ -266,8 +265,6 @@ class Completions:
             headers=extra_headers,
             timeout=timeout,
             stream=stream,
-            retry_statuses=DEFAULT_RETRY_STATUSES,
-            idempotent=False,
         )
         if stream:
             return ChatCompletionStream(resp)
@@ -325,8 +322,6 @@ class Embeddings:
             json=body,
             headers=extra_headers,
             timeout=timeout,
-            retry_statuses=DEFAULT_RETRY_STATUSES,
-            idempotent=False,
         )
         return _embeddings(resp)
 
@@ -367,8 +362,6 @@ class Rerank:
             json=body,
             headers=extra_headers,
             timeout=timeout,
-            retry_statuses=DEFAULT_RETRY_STATUSES,
-            idempotent=False,
         )
         return _rerank(resp)
 
@@ -382,7 +375,9 @@ class Caliban:
             ``http://localhost:8080/v1``.
         timeout: Seconds or an ``httpx.Timeout``; for streams it bounds the gap
             between chunks. Default 600s total, 10s connect.
-        max_retries: Retries on 429/502/503 and connect failures (default 2).
+        max_retries: Retries on 429/503 and connect failures (default 2). A POST is not
+            retried on 502 unless it carries an ``Idempotency-Key`` header (pass it in
+            ``extra_headers``); the gateway does not deduplicate on that key yet.
         http_client: Bring your own ``httpx.Client`` (custom CA, proxies, mTLS).
     """
 
@@ -520,8 +515,6 @@ class AsyncCompletions:
             headers=extra_headers,
             timeout=timeout,
             stream=stream,
-            retry_statuses=DEFAULT_RETRY_STATUSES,
-            idempotent=False,
         )
         if stream:
             return AsyncChatCompletionStream(resp)
@@ -573,8 +566,6 @@ class AsyncEmbeddings:
             json=body,
             headers=extra_headers,
             timeout=timeout,
-            retry_statuses=DEFAULT_RETRY_STATUSES,
-            idempotent=False,
         )
         return _embeddings(resp)
 
@@ -610,8 +601,6 @@ class AsyncRerank:
             json=body,
             headers=extra_headers,
             timeout=timeout,
-            retry_statuses=DEFAULT_RETRY_STATUSES,
-            idempotent=False,
         )
         return _rerank(resp)
 

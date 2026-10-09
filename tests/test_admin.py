@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 import httpx
 import pytest
 import respx
 
 from caliban import (
+    APIConnectionError,
     APIResponseValidationError,
     CalibanAdmin,
     CalibanError,
@@ -220,6 +221,118 @@ def test_usage(admin: CalibanAdmin) -> None:
         admin.usage.get(limit=5000)
 
 
+def test_deletes_return_none_on_204(admin: CalibanAdmin) -> None:
+    r = router(admin)
+    routes = [
+        r.delete("/tenants/t1").respond(204),
+        r.delete("/tenants/t1/api-keys/k1").respond(204),
+        r.delete("/tenants/t1/datasources/ds1").respond(204),
+        r.delete("/tenants/t1/nodes/n1").respond(204),
+    ]
+    calls: list[Callable[[], object]] = [
+        lambda: admin.tenants.delete("t1"),
+        lambda: admin.api_keys.revoke("t1", "k1"),
+        lambda: admin.datasources.delete("t1", "ds1"),
+        lambda: admin.nodes.delete("t1", "n1"),
+    ]
+    assert [call() for call in calls] == [None, None, None, None]
+    for route in routes:
+        assert route.call_count == 1
+        req = route.calls.last.request
+        assert req.headers["authorization"] == "Bearer adm"
+        assert req.content == b""
+
+
+DELETE_CALLS: list[tuple[str, Callable[[CalibanAdmin], None]]] = [
+    ("/tenants/gone", lambda a: a.tenants.delete("gone")),
+    ("/tenants/t1/api-keys/gone", lambda a: a.api_keys.revoke("t1", "gone")),
+    ("/tenants/t1/datasources/gone", lambda a: a.datasources.delete("t1", "gone")),
+    ("/tenants/t1/nodes/gone", lambda a: a.nodes.delete("t1", "gone")),
+]
+
+
+@pytest.mark.parametrize(("path", "call"), DELETE_CALLS, ids=[p for p, _ in DELETE_CALLS])
+def test_deletes_raise_not_found_on_404(
+    admin: CalibanAdmin, path: str, call: Callable[[CalibanAdmin], None]
+) -> None:
+    route = (
+        router(admin)
+        .delete(path)
+        .respond(
+            404,
+            json={"error": {"message": "not found", "type": "not_found", "code": None}},
+            headers={"x-caliban-request-id": "r404"},
+        )
+    )
+    with pytest.raises(NotFoundError) as exc_info:
+        call(admin)
+    assert exc_info.value.status_code == 404
+    assert route.call_count == 1
+
+
+def test_delete_paths_are_escaped() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(204)
+
+    client = CalibanAdmin(
+        token="adm",
+        base_url="http://cp.test:8081",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    client.nodes.delete("t/1", "n/1")
+    client.api_keys.revoke("t1", "../k")
+    assert [req.method for req in seen] == ["DELETE", "DELETE"]
+    assert seen[0].url.raw_path == b"/api/v1/tenants/t%2F1/nodes/n%2F1"
+    assert seen[1].url.raw_path == b"/api/v1/tenants/t1/api-keys/..%2Fk"
+
+
+def test_revoke_retried_on_502(admin: CalibanAdmin) -> None:
+    route = (
+        router(admin)
+        .delete("/tenants/t1/api-keys/k1")
+        .mock(side_effect=[httpx.Response(502), httpx.Response(204)])
+    )
+    admin.api_keys.revoke("t1", "k1")
+    assert route.call_count == 2
+
+
+def test_list_include_deleted_and_include_revoked(admin: CalibanAdmin) -> None:
+    deleted = {**TENANT, "id": "t2", "status": "deleted", "deleted_at": "2026-10-08T12:00:00Z"}
+    key = {"id": "k1", "name": "ci", "prefix": "cal_abcd", "created_at": TS}
+    revoked = {**key, "revoked_at": "2026-10-08T12:00:00Z"}
+    r = router(admin)
+    tenants = r.get("/tenants").mock(
+        side_effect=[
+            httpx.Response(200, json=[TENANT]),
+            httpx.Response(200, json=[{**TENANT, "status": "active", "deleted_at": None}, deleted]),
+            httpx.Response(200, json=[]),
+        ]
+    )
+    keys = r.get("/tenants/t1/api-keys").mock(
+        side_effect=[httpx.Response(200, json=[key]), httpx.Response(200, json=[revoked])]
+    )
+
+    old = admin.tenants.list()
+    assert old[0].status is None and old[0].deleted_at is None  # older server: fields absent
+    listed = admin.tenants.list(include_deleted=True)
+    assert [t.status for t in listed] == ["active", "deleted"]
+    assert listed[1].deleted_at is not None and listed[1].deleted_at.day == 8
+    admin.tenants.list(include_deleted=False)
+    assert [c.request.url.query for c in tenants.calls] == [
+        b"",
+        b"include_deleted=true",
+        b"include_deleted=false",
+    ]
+
+    assert admin.api_keys.list("t1")[0].revoked_at is None
+    got = admin.api_keys.list("t1", include_revoked=True)
+    assert got[0].revoked_at is not None and got[0].revoked_at.year == 2026
+    assert [c.request.url.query for c in keys.calls] == [b"", b"include_revoked=true"]
+
+
 def test_admin_errors_and_retry_policy(admin: CalibanAdmin) -> None:
     r = router(admin)
     r.get("/tenants/missing").respond(404, json={"error": {"message": "nope", "type": "not_found"}})
@@ -235,6 +348,53 @@ def test_admin_errors_and_retry_policy(admin: CalibanAdmin) -> None:
         502, json={"error": {"message": "u", "type": "upstream_error"}}
     )
     with pytest.raises(UpstreamError):
+        admin.tenants.create(name="x")
+    assert post.call_count == 1
+
+
+def test_admin_post_retried_on_429_and_503(admin: CalibanAdmin, no_sleep: list[float]) -> None:
+    post = (
+        router(admin)
+        .post("/tenants")
+        .mock(
+            side_effect=[
+                httpx.Response(429, headers={"retry-after": "1"}),
+                httpx.Response(503),
+                httpx.Response(201, json=TENANT),
+            ]
+        )
+    )
+    assert admin.tenants.create(name="Acme").id == "t1"
+    assert post.call_count == 3
+    assert no_sleep[0] == 1.0
+
+
+def test_admin_delete_retried_on_502(admin: CalibanAdmin) -> None:
+    route = (
+        router(admin)
+        .delete("/providers/p1")
+        .mock(side_effect=[httpx.Response(502), httpx.Response(204)])
+    )
+    admin.providers.delete("p1")
+    assert route.call_count == 2
+
+
+def test_admin_post_with_idempotency_key_retried_on_502() -> None:
+    with respx.mock(base_url=BASE) as r:
+        post = r.post("/tenants").mock(
+            side_effect=[httpx.Response(502), httpx.Response(201, json=TENANT)]
+        )
+        admin = CalibanAdmin(
+            token="adm", base_url=BASE, default_headers={"Idempotency-Key": "tenant-acme"}
+        )
+        assert admin.tenants.create(name="Acme").id == "t1"
+        assert post.call_count == 2
+        assert post.calls.last.request.headers["idempotency-key"] == "tenant-acme"
+
+
+def test_admin_post_not_retried_after_send_failure(admin: CalibanAdmin) -> None:
+    post = router(admin).post("/tenants").mock(side_effect=httpx.ReadError("reset"))
+    with pytest.raises(APIConnectionError):
         admin.tenants.create(name="x")
     assert post.call_count == 1
 
