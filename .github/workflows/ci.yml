@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: Python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # pyproject: requires-python >= 3.11 (oldest, middle, newest)
+        python: ["3.11", "3.13", "3.14"]
+    defaults:
+      run:
+        working-directory: sdk-python
+    steps:
+      # Lay out the workspace so tests/test_nodes.py finds ../core/schemas/node.schema.json
+      # (test_vendored_schema_in_sync_with_core is skipped otherwise).
+      - uses: actions/checkout@v7
+        with:
+          path: sdk-python
+      - uses: actions/checkout@v7
+        with:
+          repository: thecalibanproject/core
+          path: core
+          sparse-checkout: schemas
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: sdk-python/pyproject.toml
+      - run: python -m pip install -e '.[dev]'
+      - run: ruff check .
+      - run: mypy
+      - run: pytest
