@@ -144,7 +144,7 @@ resp = client.chat.completions.create(
     model="local/qwen3-8b", messages=msgs, caliban={"reasoning": "high"}
 )
 print(resp.reasoning_text)  # message.reasoning_content, or .reasoning on some servers
-print(resp.text)            # the answer
+print(resp.text)  # the answer
 ```
 
 See [Streaming](#streaming) for separating reasoning from content in a stream.
@@ -154,8 +154,15 @@ See [Streaming](#streaming) for separating reasoning from content in a stream.
 ### `Caliban` and `AsyncCaliban` (data plane)
 
 ```python
-Caliban(*, api_key=None, base_url=None, timeout=None, max_retries=2,
-        default_headers=None, http_client=None)
+# All arguments are keyword-only.
+Caliban(
+    api_key=None,
+    base_url=None,
+    timeout=None,
+    max_retries=2,
+    default_headers=None,
+    http_client=None,
+)
 ```
 
 | Argument | Default | Notes |
@@ -186,8 +193,8 @@ Caliban(*, api_key=None, base_url=None, timeout=None, max_retries=2,
 
 ```python
 emb = client.embeddings.create(
-    model="local/bge-m3",                         # a model registered with kind="embedding"
-    input=["first passage", "second passage"],    # a string or a list of strings
+    model="local/bge-m3",  # a model registered with kind="embedding"
+    input=["first passage", "second passage"],  # a string or a list of strings
 )
 vectors = emb.vectors  # list[list[float]] in input order
 print(emb.caliban.routed_model, emb.caliban.pii_entities)
@@ -202,9 +209,9 @@ docs = ["Paris is in France.", "Bananas are yellow.", "The Eiffel Tower is in Pa
 res = client.rerank.create(
     model="local/qwen3-reranker",
     query="Where is the Eiffel Tower?",
-    documents=docs,          # at least one string
-    top_n=2,                 # optional: keep only the best N
-    return_documents=True,   # optional: echo the text in results[i].document.text
+    documents=docs,  # at least one string
+    top_n=2,  # optional: keep only the best N
+    return_documents=True,  # optional: echo the text in results[i].document.text
 )
 for r in res.results:  # best first
     print(r.relevance_score, docs[r.index])
@@ -253,7 +260,8 @@ ds = admin.datasources.create(
 )
 admin.datasources.introspect(ds.id)  # starts an introspection job
 onto = admin.ontology.get(tenant_id=t.id)
-admin.ontology.approve(onto.elements[0].id, note="looks right")  # or .reject / .review(decision=...)
+# Approve an element (or .reject / .review(decision=...)).
+admin.ontology.approve(onto.elements[0].id, note="looks right")
 
 admin.nodes.create(tenant_id=t.id, name="invoice-triage", spec=load_node("triage.yaml"))
 admin.nodes.list(tenant_id=t.id)
@@ -323,8 +331,8 @@ print(f"auto margin: ${totals.margin_usd or 0:.4f} over {totals.auto_requests or
 ```python
 # Revoke a leaked key, then retire the whole tenant.
 admin.api_keys.revoke(t.id, key.id)
-admin.tenants.delete(t.id)  # revokes keys, wipes BYOK credentials, removes routes,
-                            # soft-deletes datasources and nodes
+# Revokes keys, wipes BYOK credentials, removes routes, soft-deletes datasources and nodes.
+admin.tenants.delete(t.id)
 
 # Deleted tenants and revoked keys are hidden unless you ask for them.
 tombstones = [x for x in admin.tenants.list(include_deleted=True) if x.status == "deleted"]
@@ -387,9 +395,10 @@ admin.models.delete("local/old-model")  # ConflictError (409) if a route still u
 ```python
 from caliban.nodes import NodeValidationError, lint, load_node, validate
 
-spec = load_node("invoice-triage.node.yaml")  # YAML or JSON; raises NodeValidationError listing every issue
-validate({"kind": "agent", ...})               # validate a dict or a NodeSpec
-for warning in lint(spec):                     # non-fatal checks
+# YAML or JSON; raises NodeValidationError listing every issue.
+spec = load_node("invoice-triage.node.yaml")
+validate(spec)  # takes a NodeSpec or a plain dict
+for warning in lint(spec):  # non-fatal checks
     print(warning)
 print(spec.to_yaml())
 ```
