@@ -135,13 +135,17 @@ class Tenants(_Resource):
         pii_default: PiiMode | None = None,
         pii_surrogate_scope: PiiSurrogateScope | None = None,
         semantic_cache: SemanticCacheSetting | None = None,
+        auto_cache_hit_fraction: float | None = None,
     ) -> Tenant:
+        """Create a tenant. ``auto_cache_hit_fraction`` (0..1) overrides the share of the flat
+        ``caliban/auto`` price billed for its cache hits; omit it for the deployment value."""
         body = TenantCreate(
             name=name,
             region=region,
             pii_default=pii_default,
             pii_surrogate_scope=pii_surrogate_scope,
             semantic_cache=semantic_cache,
+            auto_cache_hit_fraction=auto_cache_hit_fraction,
         ).to_body()
         return self._one(Tenant, self._post("tenants", body))
 
@@ -152,21 +156,31 @@ class Tenants(_Resource):
         pii_default: PiiMode | None = None,
         pii_surrogate_scope: PiiSurrogateScope | None = None,
         semantic_cache: SemanticCacheSetting | None = None,
+        auto_cache_hit_fraction: float | Literal["default"] | None = None,
     ) -> Tenant:
-        """Change a tenant's PII and cache settings (``PATCH``). Omitted fields keep their value.
+        """Change a tenant's PII, cache and cache-hit billing settings (``PATCH``). Omitted
+        fields keep their value.
 
         ``pii_surrogate_scope="session"`` gives every request fresh PII surrogates (requests
         cannot be linked through them, and requests carrying PII bypass the caches);
         ``"tenant"`` (the default) keeps one surrogate per value within the tenant.
         ``semantic_cache="on"`` lets eligible requests use the semantic cache (the deployment
-        must enable it too). Audited as ``tenant.update``; routers apply the change with their
-        next snapshot. Raises :class:`~caliban.NotFoundError` for an unknown or deleted tenant.
+        must enable it too). ``auto_cache_hit_fraction`` (0..1) is the share of the flat
+        ``caliban/auto`` price billed when a cache tier answers (no model is called);
+        ``"default"`` clears the override so the deployment value applies. Audited as
+        ``tenant.update``; routers apply the change with their next snapshot. Raises
+        :class:`~caliban.NotFoundError` for an unknown or deleted tenant.
         """
+        clear = auto_cache_hit_fraction == "default"
+        fraction = None if isinstance(auto_cache_hit_fraction, str) else auto_cache_hit_fraction
         body = TenantUpdate(
             pii_default=pii_default,
             pii_surrogate_scope=pii_surrogate_scope,
             semantic_cache=semantic_cache,
+            auto_cache_hit_fraction=fraction,
         ).to_body()
+        if clear:
+            body["auto_cache_hit_fraction"] = None
         return self._one(Tenant, self._patch(f"tenants/{_p(tenant_id)}", body))
 
 

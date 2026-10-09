@@ -457,6 +457,35 @@ def test_tenant_update_escapes_path_and_rejects_bad_values() -> None:
     assert len(seen) == 1
 
 
+def test_tenant_cache_hit_fraction_set_clear_and_validated(admin: CalibanAdmin) -> None:
+    r = router(admin)
+    route = r.patch("/tenants/t1").mock(
+        side_effect=[
+            httpx.Response(200, json={**TENANT, "auto_cache_hit_fraction": 0.15}),
+            httpx.Response(200, json={**TENANT, "auto_cache_hit_fraction": None}),
+        ]
+    )
+    t = admin.tenants.update("t1", auto_cache_hit_fraction=0.15)
+    assert json.loads(route.calls[0].request.content) == {"auto_cache_hit_fraction": 0.15}
+    assert t.auto_cache_hit_fraction == 0.15
+    # "default" sends an explicit null: the override is cleared, the deployment value applies.
+    t = admin.tenants.update("t1", auto_cache_hit_fraction="default")
+    assert json.loads(route.calls[1].request.content) == {"auto_cache_hit_fraction": None}
+    assert t.auto_cache_hit_fraction is None
+    # Out of range never reaches the server.
+    for bad in (1.5, -0.1):
+        with pytest.raises(ValueError, match="auto_cache_hit_fraction"):
+            admin.tenants.update("t1", auto_cache_hit_fraction=bad)
+    assert route.call_count == 2
+    create = r.post("/tenants").respond(201, json={**TENANT, "auto_cache_hit_fraction": 0.1})
+    created = admin.tenants.create(name="Acme", auto_cache_hit_fraction=0.1)
+    assert json.loads(create.calls.last.request.content) == {
+        "name": "Acme",
+        "auto_cache_hit_fraction": 0.1,
+    }
+    assert created.auto_cache_hit_fraction == 0.1
+
+
 def test_tenant_update_not_found(admin: CalibanAdmin) -> None:
     route = (
         router(admin)
@@ -508,6 +537,7 @@ def test_tenant_settings_on_create_and_older_servers(admin: CalibanAdmin) -> Non
     assert (t.pii_surrogate_scope, t.semantic_cache) == ("tenant", "off")
     older = admin.tenants.list()[0]
     assert older.pii_surrogate_scope is None and older.semantic_cache is None
+    assert older.auto_cache_hit_fraction is None
 
 
 USAGE_BASE = {
@@ -530,8 +560,10 @@ USAGE_AUTO_HIT = {
     "requested_model": "caliban/auto",
     "intent_confidence": 0.912,
     "route_stage": "knn",
-    "routed_model_cost_usd": 0.000026,
+    "routed_model_cost_usd": 0,
     "flat_price_usd": 0.00026,
+    "billed_usd": 0.000052,
+    "saved_usd": 0.000208,
 }
 USAGE_TOTALS = {
     "requests": 2,
@@ -540,11 +572,15 @@ USAGE_TOTALS = {
     "cache_hits": 1,
     "semantic_cache_hits": 1,
     "tokens_saved": 19,
+    "saved_usd": 0.000208,
     "cost_usd": 0.000026,
     "auto_requests": 1,
+    "auto_cache_hits": 1,
     "flat_price_usd": 0.00026,
-    "routed_model_cost_usd": 0.000026,
-    "margin_usd": 0.000234,
+    "billed_usd": 0.000052,
+    "auto_saved_usd": 0.000208,
+    "routed_model_cost_usd": 0,
+    "margin_usd": 0.000052,
 }
 
 
@@ -564,12 +600,18 @@ def test_usage_new_event_fields_and_totals(admin: CalibanAdmin) -> None:
         0.912,
         "knn",
     )
-    assert (auto.routed_model_cost_usd, auto.flat_price_usd) == (0.000026, 0.00026)
+    assert (auto.routed_model_cost_usd, auto.flat_price_usd) == (0, 0.00026)
+    # A caliban/auto cache hit: billed a share of the flat price, the rest is the saving.
+    assert (auto.billed_usd, auto.saved_usd) == (0.000052, 0.000208)
+    assert plain.billed_usd is None and plain.saved_usd is None
     totals = rep.totals
     assert totals.model_dump(exclude_none=True) == USAGE_TOTALS
     assert totals.semantic_cache_hits == 1 and totals.auto_requests == 1
     assert totals.flat_price_usd is not None and totals.routed_model_cost_usd is not None
-    assert totals.margin_usd == pytest.approx(totals.flat_price_usd - totals.routed_model_cost_usd)
+    assert totals.billed_usd is not None and totals.auto_saved_usd is not None
+    assert totals.auto_cache_hits == 1
+    assert totals.margin_usd == pytest.approx(totals.billed_usd - totals.routed_model_cost_usd)
+    assert totals.auto_saved_usd == pytest.approx(totals.flat_price_usd - totals.billed_usd)
 
 
 def test_usage_from_older_server_without_new_fields(admin: CalibanAdmin) -> None:
@@ -582,6 +624,7 @@ def test_usage_from_older_server_without_new_fields(admin: CalibanAdmin) -> None
     assert (totals.requests, totals.cache_hits) == (1, 0)
     assert totals.semantic_cache_hits is None and totals.auto_requests is None
     assert totals.flat_price_usd is None and totals.margin_usd is None
+    assert totals.billed_usd is None and totals.auto_cache_hits is None
 
 
 def test_usage_cache_enum_unchanged(admin: CalibanAdmin) -> None:

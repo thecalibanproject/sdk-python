@@ -122,6 +122,10 @@ class Tenant(_Response):
     """Surrogate consistency for reversible PII. ``None`` from older servers."""
     semantic_cache: SemanticCacheSetting | None = None
     """Whether the tenant may use the semantic cache. ``None`` from older servers."""
+    auto_cache_hit_fraction: float | None = None
+    """Share of the flat ``caliban/auto`` price billed for this tenant's cache hits, 0..1.
+    ``None``: the deployment's ``[routing] auto_cache_hit_fraction`` (0.2 unless configured)
+    applies, or an older server."""
     created_at: datetime
     status: TenantStatus | None = None
     """``"deleted"`` only appears with ``include_deleted=True``. ``None`` from older servers."""
@@ -134,14 +138,19 @@ class TenantCreate(_Request):
     pii_default: PiiMode | None = None
     pii_surrogate_scope: PiiSurrogateScope | None = None
     semantic_cache: SemanticCacheSetting | None = None
+    auto_cache_hit_fraction: float | None = Field(default=None, ge=0, le=1)
 
 
 class TenantUpdate(_Request):
-    """Body of ``PATCH /api/v1/tenants/{tenantId}``. Unset fields keep their value."""
+    """Body of ``PATCH /api/v1/tenants/{tenantId}``. Unset fields keep their value.
+
+    ``auto_cache_hit_fraction`` is sent only when set; clearing it (an explicit ``null``) goes
+    through ``tenants.update(..., auto_cache_hit_fraction="default")``."""
 
     pii_default: PiiMode | None = None
     pii_surrogate_scope: PiiSurrogateScope | None = None
     semantic_cache: SemanticCacheSetting | None = None
+    auto_cache_hit_fraction: float | None = Field(default=None, ge=0, le=1)
 
 
 class ApiKeyInfo(_Response):
@@ -366,8 +375,16 @@ class UsageEvent(_Response):
     """``caliban/auto`` only: real cost of the routed model for this request. Absent when the
     model has no price."""
     flat_price_usd: float | None = None
-    """``caliban/auto`` only: the flat auto price for the same tokens; ``0`` on a cache hit.
-    Margin is ``flat_price_usd - routed_model_cost_usd``."""
+    """``caliban/auto`` only: the full flat auto price for the same tokens. On a cache hit, the
+    flat price of the cached answer's tokens (what a miss would have billed)."""
+    billed_usd: float | None = None
+    """``caliban/auto`` only: what the customer is billed. ``flat_price_usd`` on a miss; on a
+    cache hit, ``flat_price_usd`` times the tenant's cache-hit fraction. Margin is
+    ``billed_usd - routed_model_cost_usd``. ``None`` from older servers (they billed
+    ``flat_price_usd``)."""
+    saved_usd: float | None = None
+    """Priced cache hits only: what the hit saved. ``caliban/auto``: ``flat_price_usd -
+    billed_usd``; other models: the model cost the hit avoided."""
 
 
 class UsageTotals(_Response):
@@ -378,15 +395,23 @@ class UsageTotals(_Response):
     """Hits of both cache tiers."""
     semantic_cache_hits: int | None = None
     tokens_saved: int | None = None
+    saved_usd: float | None = None
+    """What cache hits saved customers, all models."""
     cost_usd: float | None = None
     auto_requests: int | None = None
     """Requests that asked for ``caliban/auto``."""
+    auto_cache_hits: int | None = None
+    """``caliban/auto`` requests answered from cache (billed at the discounted price)."""
     flat_price_usd: float | None = None
-    """Sum over ``caliban/auto`` events that carry both prices."""
+    """Full flat price, summed over ``caliban/auto`` events that carry both prices."""
+    billed_usd: float | None = None
+    """What those events were billed (the flat price on misses, discounted on cache hits)."""
+    auto_saved_usd: float | None = None
+    """What ``caliban/auto`` cache hits saved: ``flat_price_usd - billed_usd`` over hits."""
     routed_model_cost_usd: float | None = None
-    """Sum over the same events."""
+    """Sum over the same events (``0`` on cache hits)."""
     margin_usd: float | None = None
-    """``flat_price_usd - routed_model_cost_usd``."""
+    """``billed_usd - routed_model_cost_usd``."""
 
 
 class UsageReport(_Response):

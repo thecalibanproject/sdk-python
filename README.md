@@ -291,6 +291,7 @@ The constructor takes `token`, `base_url`, `timeout` (default 30 s), `max_retrie
 | `pii_default` | `"off"`, `"mask"`, `"reversible"` | `"reversible"` | PII mode for requests that do not set `caliban.pii`. |
 | `pii_surrogate_scope` | `"tenant"`, `"session"` | `"tenant"` | How reversible PII surrogates are chosen. |
 | `semantic_cache` | `"off"`, `"on"` | `"off"` | Whether the tenant's eligible requests may use the semantic cache. |
+| `auto_cache_hit_fraction` | `0` to `1`, or `"default"` | deployment value | Share of the flat `caliban/auto` price billed for the tenant's cache hits. `"default"` clears the override, so the deployment's `[routing] auto_cache_hit_fraction` (0.2 unless configured) applies. |
 
 ```python
 admin.tenants.update(t.id, semantic_cache="on")
@@ -300,6 +301,7 @@ print(t.pii_surrogate_scope, t.semantic_cache)  # session on
 
 - **`pii_surrogate_scope="tenant"`** (the default): a given value always gets the same surrogate within the tenant (a keyed HMAC per tenant, derived from `CALIBAN_KEK`). That lets pseudonymised requests hit the exact cache. The trade-off is linkability: anyone who can see the pseudonymised traffic (an upstream provider, for example) can tell that two requests or sessions of the tenant mention the same person, even without learning who it is. Surrogates never cross tenants.
 - **`pii_surrogate_scope="session"`**: every request gets fresh surrogates, so requests cannot be linked through them. Requests that carry PII then bypass the exact and semantic caches.
+- **`auto_cache_hit_fraction`**: a cache hit (exact or semantic) calls no model, so a `caliban/auto` request answered from cache is billed this share of the flat price. Values outside 0 to 1 raise `ValueError` before any request. On `Tenant`, `None` means the deployment value applies.
 - **`semantic_cache="on"`**: an eligible request may be answered with the response to an earlier, semantically similar request of the same tenant (same model, system prompt, history and parameters). Entries never cross tenants. The deployment must also enable it (`[cache.semantic] enabled`). Hits report `x-caliban-cache: hit` with `x-caliban-cache-tier: semantic`.
 
 Both fields are `None` on tenants from an older server.
@@ -316,14 +318,17 @@ Both fields are `None` on tenants from an older server.
 | `intent_confidence` | Chat requests | Confidence of the intent decision, 0..1. |
 | `route_stage` | Chat requests | `"rules"`, `"knn"` or `"keyword"`. |
 | `routed_model_cost_usd` | `caliban/auto`, priced model | Real cost of the routed model for this request. |
-| `flat_price_usd` | `caliban/auto` | The flat auto price for the same tokens. `0` on a cache hit. |
+| `flat_price_usd` | `caliban/auto` | The full flat auto price for the same tokens. On a cache hit, the flat price of the cached answer's tokens (what a miss would have billed). |
+| `billed_usd` | `caliban/auto` | What the customer is billed: `flat_price_usd` on a miss, `flat_price_usd` times the tenant's cache-hit fraction on a hit. |
+| `saved_usd` | Priced cache hits | What the hit saved: `flat_price_usd - billed_usd` for `caliban/auto`, the avoided model cost for other models. |
 
-`totals` adds `semantic_cache_hits` (`cache_hits` counts both tiers), `auto_requests` (requests for `caliban/auto`), and `flat_price_usd`, `routed_model_cost_usd` and `margin_usd` (`flat_price_usd - routed_model_cost_usd`), summed over the `caliban/auto` events that carry both prices.
+`totals` adds `semantic_cache_hits` (`cache_hits` counts both tiers), `saved_usd` (what cache hits saved, all models), `auto_requests` (requests for `caliban/auto`) and `auto_cache_hits`, and, summed over the `caliban/auto` events that carry both prices, `flat_price_usd`, `billed_usd`, `auto_saved_usd`, `routed_model_cost_usd` and `margin_usd` (`billed_usd - routed_model_cost_usd`).
 
 ```python
 totals = admin.usage.get(tenant_id=t.id).totals
 print(f"{totals.semantic_cache_hits or 0} of {totals.cache_hits or 0} hits were semantic")
 print(f"auto margin: ${totals.margin_usd or 0:.4f} over {totals.auto_requests or 0} requests")
+print(f"{totals.auto_cache_hits or 0} auto cache hits saved ${totals.auto_saved_usd or 0:.4f}")
 ```
 
 **Deleting and revoking.** `tenants.delete(tenant_id)`, `api_keys.revoke(tenant_id, key_id)`, `datasources.delete(tenant_id, datasource_id)` and `nodes.delete(tenant_id, node_id)` return `None` on success (204). An unknown id, an id that belongs to another tenant, or one that is already deleted raises `NotFoundError`, so a repeated delete raises too.
