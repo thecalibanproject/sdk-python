@@ -1,0 +1,103 @@
+"""Caliban Python SDK.
+
+* :class:`Caliban` / :class:`AsyncCaliban`: OpenAI-compatible data plane (``/v1``).
+* :class:`caliban.admin.CalibanAdmin`: control plane (``/api/v1``).
+* :mod:`caliban.nodes`: node spec authoring and validation.
+* :mod:`caliban.evals`: golden-set eval harness (``caliban-eval``).
+"""
+
+from ._client import DEFAULT_BASE_URL, AsyncCaliban, Caliban
+from ._streaming import (
+    AsyncChatCompletionStream,
+    ChatCompletionStream,
+    ServerSentEvent,
+    SSEDecoder,
+    StreamText,
+    TextPart,
+)
+from ._version import __version__
+from .admin import CalibanAdmin
+from .errors import (
+    APIConnectionError,
+    APIError,
+    APIResponseValidationError,
+    APIStatusError,
+    APITimeoutError,
+    AuthenticationError,
+    BadRequestError,
+    CalibanError,
+    ConflictError,
+    InternalServerError,
+    NotFoundError,
+    PermissionDeniedError,
+    PolicyViolationError,
+    RateLimitError,
+    ServiceUnavailableError,
+    StreamError,
+    UnprocessableEntityError,
+    UpstreamError,
+)
+from .types import (
+    CalibanOptions,
+    CalibanResponseMeta,
+    ChatCompletion,
+    ChatCompletionChunk,
+    ChatMessage,
+    CreateEmbeddingResponse,
+    Embedding,
+    Model,
+    ModelCalibanInfo,
+    ModelCapabilities,
+    ModelList,
+    ReasoningEffort,
+    RerankDocument,
+    RerankResponse,
+    RerankResult,
+)
+
+__all__ = [
+    "DEFAULT_BASE_URL",
+    "APIConnectionError",
+    "APIError",
+    "APIResponseValidationError",
+    "APIStatusError",
+    "APITimeoutError",
+    "AsyncCaliban",
+    "AsyncChatCompletionStream",
+    "AuthenticationError",
+    "BadRequestError",
+    "Caliban",
+    "CalibanAdmin",
+    "CalibanError",
+    "CalibanOptions",
+    "CalibanResponseMeta",
+    "ChatCompletion",
+    "ChatCompletionChunk",
+    "ChatCompletionStream",
+    "ChatMessage",
+    "ConflictError",
+    "CreateEmbeddingResponse",
+    "Embedding",
+    "InternalServerError",
+    "Model",
+    "ModelCalibanInfo",
+    "ModelCapabilities",
+    "ModelList",
+    "NotFoundError",
+    "PermissionDeniedError",
+    "PolicyViolationError",
+    "RateLimitError",
+    "ReasoningEffort",
+    "RerankDocument",
+    "RerankResponse",
+    "RerankResult",
+    "SSEDecoder",
+    "ServerSentEvent",
+    "ServiceUnavailableError",
+    "StreamError",
+    "StreamText",
+    "TextPart",
+    "UnprocessableEntityError",
+    "UpstreamError",
+    "__version__",
+]

@@ -1,0 +1,49 @@
+# Example node spec (mirrors core/schemas/node.schema.json v0).
+kind: workflow
+description: Triage incoming invoices and approve small ones.
+prompt:
+  system: You triage invoices. Answer with JSON.
+  output_schema:
+    type: object
+    required: [decision]
+    properties:
+      decision: { enum: [approve, escalate, reject] }
+model_policy:
+  intent_classes: [extraction, reasoning]
+  candidates: [tier:small, tier:frontier]
+  escalate_on: [schema_violation, low_confidence]
+  max_cost_usd: 0.05
+  min_trust_tier: t1_attested
+tools:
+  - ref: mcp://erp/lookup_invoice#sha256:3f2a
+    effect: read
+  - ref: mcp://erp/approve_invoice#sha256:9b1c
+    effect: write
+    requires: [untainted_args, human_approval>1000usd]
+  - ref: node://vendor-risk@v3
+    effect: read
+datasources:
+  scopes: [erp.invoices:read, docs.vendor_contracts:read]
+memory:
+  short_term: run
+  long_term: { scope: end_user, ttl_days: 90 }
+guardrails:
+  pii: reversible
+  injection_mode: plan_then_execute
+  egress: [erp.internal]
+budgets: { steps: 20, depth: 3, fanout: 8, tokens: 200000, wall_clock_s: 120 }
+exposure: { mcp_tool: true, a2a_agent: true, http: true }
+graph:
+  vertices:
+    - { id: classify, type: router }
+    - { id: extract, type: llm }
+    - { id: check, type: verify, max_iterations: 3 }
+    - { id: approve, type: tool }
+  edges:
+    - { from: classify, to: extract }
+    - { from: extract, to: check }
+    - { from: check, to: extract, when: "schema_violation" }
+    - { from: check, to: approve, when: "ok" }
+eval:
+  suite: invoice-triage-golden
+  metrics: [pass^k, cost_per_success]

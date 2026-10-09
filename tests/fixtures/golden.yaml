@@ -1,0 +1,26 @@
+name: demo-golden
+description: Example golden set used by the tests.
+defaults:
+  model: caliban/auto
+  system: Answer tersely.
+  temperature: 0
+  caliban: { pii: mask }
+cases:
+  - id: capital
+    input: What is the capital of France?
+    expected: Paris
+    tags: [geo]
+  - id: math
+    input: What is 6 times 7?
+    check: { type: regex, pattern: "\\b42\\b" }
+  - id: json
+    messages:
+      - { role: user, content: "Return {\"ok\": true} as JSON." }
+    checks:
+      - type: json_schema
+        schema:
+          type: object
+          required: [ok]
+          properties: { ok: { const: true } }
+          additionalProperties: false
+      - { type: contains, value: [ok], case_sensitive: false }
