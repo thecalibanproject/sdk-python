@@ -1,6 +1,8 @@
 """Node authoring: typed spec, YAML loading and validation."""
 
 from .spec import (
+    BUILTIN_TOOLS,
+    AgentLoop,
     Budgets,
     DatasourceScopes,
     Edge,
@@ -8,6 +10,7 @@ from .spec import (
     Exposure,
     Graph,
     Guardrails,
+    Guards,
     LongTermMemory,
     Memory,
     ModelPolicy,
@@ -24,6 +27,8 @@ from .spec import (
 )
 
 __all__ = [
+    "BUILTIN_TOOLS",
+    "AgentLoop",
     "Budgets",
     "DatasourceScopes",
     "Edge",
@@ -31,6 +36,7 @@ __all__ = [
     "Exposure",
     "Graph",
     "Guardrails",
+    "Guards",
     "LongTermMemory",
     "Memory",
     "ModelPolicy",

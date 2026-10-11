@@ -14,12 +14,14 @@
       "required": ["system"],
       "properties": {
         "system": { "type": "string" },
-        "output_schema": { "type": "object" }
+        "input_schema": { "type": "object", "description": "Validated against the run input (JSON Schema subset, see crates/caliban-nodes/src/schema.rs)" },
+        "output_schema": { "type": "object", "description": "Validated against the run output (JSON Schema subset)" }
       }
     },
     "model_policy": {
       "type": "object",
       "properties": {
+        "model": { "type": "string", "description": "Model id (or caliban/auto) the node's calls ask for; default: the first candidate that is a model id, else caliban/auto" },
         "intent_classes": { "type": "array", "items": { "type": "string" } },
         "candidates": { "type": "array", "items": { "type": "string" }, "description": "Model ids or tiers (tier:small, tier:frontier)" },
         "escalate_on": { "type": "array", "items": { "enum": ["schema_violation", "low_confidence", "tool_error"] } },
@@ -33,9 +35,10 @@
         "type": "object",
         "required": ["ref", "effect"],
         "properties": {
-          "ref": { "type": "string", "pattern": "^(mcp|node)://", "description": "mcp://server/tool#sha256:<hash> or node://name@vN" },
+          "ref": { "type": "string", "pattern": "^(mcp|node|builtin)://", "description": "mcp://server/tool#sha256:<hash> (an approved manifest), node://name@vN or builtin://datasource_query" },
           "effect": { "enum": ["read", "write"] },
-          "requires": { "type": "array", "items": { "type": "string" } }
+          "requires": { "type": "array", "items": { "type": "string" } },
+          "allow_tainted": { "type": "array", "items": { "type": "string" }, "description": "effect=write: taint labels its arguments may carry without a human approval (tool:<server>/*, datasource, *)" }
         }
       }
     },
@@ -58,6 +61,11 @@
         "egress": { "type": "array", "items": { "type": "string" } }
       }
     },
+    "agent": {
+      "type": "object",
+      "description": "Only for kind=agent: the bounded tool loop.",
+      "properties": { "max_turns": { "type": "integer", "minimum": 1, "description": "Model turns at most (default: budgets.steps)" } }
+    },
     "budgets": {
       "type": "object",
       "required": ["steps", "tokens", "wall_clock_s"],
@@ -66,7 +74,16 @@
         "depth": { "type": "integer", "minimum": 1, "maximum": 10, "default": 3 },
         "fanout": { "type": "integer", "minimum": 1, "maximum": 64, "default": 8 },
         "tokens": { "type": "integer", "minimum": 1 },
-        "wall_clock_s": { "type": "integer", "minimum": 1 }
+        "wall_clock_s": { "type": "integer", "minimum": 1 },
+        "usd": { "type": "number", "exclusiveMinimum": 0, "description": "Most one run may spend on model calls (USD, priced like the metering)" }
+      }
+    },
+    "guards": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_repeats": { "type": "integer", "minimum": 1, "default": 3, "description": "Loop guard: the same vertex with the same input at most this many times" },
+        "tool_retries": { "type": "integer", "minimum": 0, "default": 2, "description": "Retries of a tool call that failed transiently" }
       }
     },
     "exposure": {
@@ -75,8 +92,9 @@
     },
     "graph": {
       "type": "object",
-      "description": "Only for kind=workflow. Vertices + edges; loops must declare max_iterations.",
+      "description": "Only for kind=workflow. Vertices + edges; loops must declare max_iterations. See docs/nodes.md for each vertex type's config.",
       "properties": {
+        "entry": { "type": "string", "description": "The vertex a run starts at (default: the first)" },
         "vertices": {
           "type": "array",
           "items": {
@@ -84,7 +102,7 @@
             "required": ["id", "type"],
             "properties": {
               "id": { "type": "string" },
-              "type": { "enum": ["llm", "tool", "router", "map", "reduce", "verify", "human", "subnode", "code"] },
+              "type": { "enum": ["llm", "tool", "router", "map", "reduce", "verify", "human", "subnode", "code"], "description": "code is not yet supported (refused at publish)" },
               "config": { "type": "object" },
               "max_iterations": { "type": "integer", "minimum": 1 }
             }

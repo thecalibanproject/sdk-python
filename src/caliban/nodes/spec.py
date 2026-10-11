@@ -20,6 +20,8 @@ from pydantic import ValidationError as PydanticValidationError
 from ..errors import CalibanError
 
 __all__ = [
+    "BUILTIN_TOOLS",
+    "AgentLoop",
     "Budgets",
     "DatasourceScopes",
     "Edge",
@@ -27,6 +29,7 @@ __all__ = [
     "Exposure",
     "Graph",
     "Guardrails",
+    "Guards",
     "LongTermMemory",
     "Memory",
     "ModelPolicy",
@@ -54,10 +57,16 @@ class _Open(BaseModel):
 
 class Prompt(_Open):
     system: str
+    input_schema: dict[str, Any] | None = None
+    """Validated against the run input (a JSON Schema subset)."""
     output_schema: dict[str, Any] | None = None
+    """Validated against the run output (a JSON Schema subset)."""
 
 
 class ModelPolicy(_Open):
+    model: str | None = None
+    """Model id (or ``caliban/auto``) the node's calls ask for. Default: the first
+    candidate that is a model id, else ``caliban/auto``."""
     intent_classes: list[str] | None = None
     candidates: list[str] | None = None
     """Model ids or tiers (``tier:small``, ``tier:frontier``)."""
@@ -66,11 +75,19 @@ class ModelPolicy(_Open):
     min_trust_tier: TrustTier | None = None
 
 
+BUILTIN_TOOLS: tuple[str, ...] = ("datasource_query",)
+"""Tools Caliban provides itself, referenced as ``builtin://<name>`` (read only)."""
+
+
 class ToolRef(_Open):
-    ref: Annotated[str, Field(pattern=r"^(mcp|node)://")]
-    """``mcp://server/tool#sha256:<hash>`` or ``node://name@vN``."""
+    ref: Annotated[str, Field(pattern=r"^(mcp|node|builtin)://")]
+    """``mcp://server/tool#sha256:<hash>`` (an approved manifest), ``node://name@vN``
+    or ``builtin://datasource_query``."""
     effect: Literal["read", "write"]
     requires: list[str] | None = None
+    allow_tainted: list[str] | None = None
+    """``effect: write`` only: taint labels its arguments may carry without a human
+    approval (``tool:<server>/*``, ``datasource``, ``*``)."""
 
 
 class DatasourceScopes(_Open):
@@ -93,12 +110,32 @@ class Guardrails(_Open):
     egress: list[str] | None = None
 
 
+class AgentLoop(_Open):
+    """Only for ``kind: agent``: the bounded tool loop."""
+
+    max_turns: Annotated[StrictInt, Field(ge=1)] | None = None
+    """Model turns at most (default: ``budgets.steps``)."""
+
+
 class Budgets(_Open):
     steps: Annotated[StrictInt, Field(ge=1, le=200)]
     depth: Annotated[StrictInt, Field(ge=1, le=10)] = 3
     fanout: Annotated[StrictInt, Field(ge=1, le=64)] = 8
     tokens: Annotated[StrictInt, Field(ge=1)]
     wall_clock_s: Annotated[StrictInt, Field(ge=1)]
+    usd: Annotated[StrictFloat, Field(gt=0)] | None = None
+    """Most one run may spend on model calls (USD, priced like the metering)."""
+
+
+class Guards(BaseModel):
+    """Run guards. Unlike the other sections, unknown keys are rejected."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_repeats: Annotated[StrictInt, Field(ge=1)] = 3
+    """Loop guard: the same vertex with the same input at most this many times."""
+    tool_retries: Annotated[StrictInt, Field(ge=0)] = 2
+    """Retries of a tool call that failed transiently."""
 
 
 class Exposure(_Open):
@@ -113,6 +150,7 @@ VertexType = Literal["llm", "tool", "router", "map", "reduce", "verify", "human"
 class Vertex(_Open):
     id: str
     type: VertexType
+    """``code`` is not yet supported (core refuses it at publish)."""
     config: dict[str, Any] | None = None
     max_iterations: Annotated[StrictInt, Field(ge=1)] | None = None
 
@@ -126,6 +164,8 @@ class Edge(_Open):
 
 
 class Graph(_Open):
+    entry: str | None = None
+    """The vertex a run starts at (default: the first)."""
     vertices: list[Vertex] | None = None
     edges: list[Edge] | None = None
 
@@ -148,7 +188,9 @@ class NodeSpec(BaseModel):
     datasources: DatasourceScopes | None = None
     memory: Memory | None = None
     guardrails: Guardrails | None = None
+    agent: AgentLoop | None = None
     budgets: Budgets
+    guards: Guards | None = None
     exposure: Exposure | None = None
     graph: Graph | None = None
     eval: EvalConfig | None = None
@@ -229,6 +271,8 @@ def semantic_issues(spec: NodeSpec) -> list[str]:
     issues: list[str] = []
     if spec.graph is not None and spec.kind != "workflow":
         issues.append("graph: only allowed when kind=workflow")
+    if spec.agent is not None and spec.kind != "agent":
+        issues.append("agent: only allowed when kind=agent")
     if spec.kind == "workflow" and (spec.graph is None or not spec.graph.vertices):
         issues.append("graph: kind=workflow requires graph.vertices")
     if spec.graph is not None:
@@ -238,6 +282,8 @@ def semantic_issues(spec: NodeSpec) -> list[str]:
         for d in dupes:
             issues.append(f"graph.vertices: duplicate id {d!r}")
         known = set(ids)
+        if spec.graph.entry is not None and spec.graph.entry not in known:
+            issues.append(f"graph.entry: unknown vertex {spec.graph.entry!r}")
         edges: list[tuple[str, str]] = []
         for n, e in enumerate(spec.graph.edges or []):
             bad = [x for x in (e.from_, e.to) if x not in known]
@@ -291,6 +337,22 @@ def lint(spec: NodeSpec) -> list[str]:
             warnings.append(f"tools[{i}].ref: MCP tool is not pinned (#sha256:<hash>)")
         if tool.ref.startswith("node://") and "@v" not in tool.ref:
             warnings.append(f"tools[{i}].ref: node tool is not pinned (@vN)")
+        if tool.ref.startswith("builtin://"):
+            name = tool.ref.removeprefix("builtin://")
+            if name not in BUILTIN_TOOLS:
+                known = ", ".join(f"builtin://{b}" for b in BUILTIN_TOOLS)
+                warnings.append(f"tools[{i}].ref: unknown built-in tool (known: {known})")
+            if tool.effect != "read":
+                warnings.append(f"tools[{i}].effect: built-in tools are read only")
+            if name == "datasource_query" and not (spec.datasources and spec.datasources.scopes):
+                warnings.append(f"tools[{i}].ref: datasource_query needs datasources.scopes")
+        if tool.allow_tainted is not None and tool.effect != "write":
+            warnings.append(f"tools[{i}].allow_tainted: only applies to effect=write tools")
+    for i, vertex in enumerate(spec.graph.vertices or [] if spec.graph else []):
+        if vertex.type == "code":
+            warnings.append(
+                f"graph.vertices[{i}].type: code is not yet supported (refused at publish)"
+            )
     has_write = any(t.effect == "write" for t in spec.tools or [])
     mode = spec.guardrails.injection_mode if spec.guardrails else None
     if has_write and mode in (None, "none"):

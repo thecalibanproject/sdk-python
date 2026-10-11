@@ -99,6 +99,20 @@ def test_unknown_top_level_key_rejected() -> None:
         ("guardrails.injection_mode", "pray"),
         ("guardrails.pii", "anonymize"),
         ("exposure.http", "yes"),
+        ("prompt.input_schema", "not-an-object"),
+        ("model_policy.model", 5),
+        ("tools", [{"ref": "file://x", "effect": "read"}]),
+        ("tools", [{"ref": "mcp://x/y", "effect": "write", "allow_tainted": "*"}]),
+        ("agent.max_turns", 0),
+        ("agent.max_turns", 2.0),
+        ("budgets.usd", 0),
+        ("budgets.usd", -1.0),
+        ("budgets.usd", "0.5"),
+        ("budgets.usd", True),
+        ("guards.max_repeats", 0),
+        ("guards.tool_retries", -1),
+        ("guards.tool_retries", "2"),
+        ("guards.retries", 2),
     ],
 )
 def test_schema_violations(path: str, value: Any) -> None:
@@ -210,3 +224,84 @@ def test_nodespec_matches_vendored_schema() -> None:
 def test_vendored_schema_in_sync_with_core() -> None:
     core = json.loads(CORE_SCHEMA.read_text())
     assert core == json_schema(), "re-copy core/schemas/node.schema.json into src/caliban/nodes/"
+
+
+def test_new_core_fields() -> None:
+    spec = validate(
+        {
+            **MINIMAL,
+            "prompt": {"system": "x", "input_schema": {"type": "object"}},
+            "model_policy": {"model": "caliban/auto"},
+            "tools": [
+                {"ref": "builtin://datasource_query", "effect": "read"},
+                {
+                    "ref": "mcp://erp/approve#sha256:ab",
+                    "effect": "write",
+                    "allow_tainted": ["tool:erp/*", "datasource"],
+                },
+            ],
+            "datasources": {"scopes": ["erp.invoices:read"]},
+            "guardrails": {"injection_mode": "camel"},
+            "agent": {"max_turns": 4},
+            "budgets": {"steps": 5, "tokens": 100, "wall_clock_s": 10, "usd": 1},
+            "guards": {"max_repeats": 2, "tool_retries": 0},
+        }
+    )
+    assert spec.prompt.input_schema == {"type": "object"}
+    assert spec.model_policy.model == "caliban/auto"
+    assert spec.tools is not None and spec.tools[1].allow_tainted == ["tool:erp/*", "datasource"]
+    assert spec.agent is not None and spec.agent.max_turns == 4
+    assert spec.budgets.usd == 1
+    assert spec.guards is not None
+    assert (spec.guards.max_repeats, spec.guards.tool_retries) == (2, 0)
+    assert lint(spec) == []
+    assert validate(spec.to_dict()) == spec
+
+
+def test_guards_defaults_and_closed() -> None:
+    spec = validate(with_("guards", {}))
+    assert spec.guards is not None
+    assert (spec.guards.max_repeats, spec.guards.tool_retries) == (3, 2)
+    assert validate(MINIMAL).guards is None
+    assert issues_of(with_("guards", {"max_turns": 3})) == [
+        "guards.max_turns: Extra inputs are not permitted"
+    ]
+
+
+def test_agent_only_for_agent_kind() -> None:
+    spec = _workflow([{"id": "a", "type": "llm"}], [])
+    validate(spec)
+    assert issues_of({**spec, "agent": {"max_turns": 2}}) == ["agent: only allowed when kind=agent"]
+
+
+def test_graph_entry_must_be_a_vertex() -> None:
+    spec = _workflow([{"id": "a", "type": "llm"}, {"id": "b", "type": "llm"}], [])
+    spec["graph"]["entry"] = "b"
+    assert validate(spec).graph is not None
+    spec["graph"]["entry"] = "zzz"
+    assert issues_of(spec) == ["graph.entry: unknown vertex 'zzz'"]
+
+
+def test_lint_builtin_tools_and_taint() -> None:
+    spec = validate(
+        {
+            **MINIMAL,
+            "tools": [
+                {"ref": "builtin://datasource_query", "effect": "read"},
+                {"ref": "builtin://shell", "effect": "write"},
+                {"ref": "node://risk@v1", "effect": "read", "allow_tainted": ["*"]},
+            ],
+            "guardrails": {"injection_mode": "camel"},
+        }
+    )
+    assert lint(spec) == [
+        "tools[0].ref: datasource_query needs datasources.scopes",
+        "tools[1].ref: unknown built-in tool (known: builtin://datasource_query)",
+        "tools[1].effect: built-in tools are read only",
+        "tools[2].allow_tainted: only applies to effect=write tools",
+    ]
+
+
+def test_lint_code_vertex() -> None:
+    spec = validate(_workflow([{"id": "a", "type": "llm"}, {"id": "b", "type": "code"}], []))
+    assert "graph.vertices[1].type: code is not yet supported (refused at publish)" in lint(spec)

@@ -408,13 +408,16 @@ for warning in lint(spec):  # non-fatal checks
 print(spec.to_yaml())
 ```
 
-`validate` enforces the JSON Schema rules (required fields, enums, budget bounds, tool-ref and scope patterns, strict integers, no unknown top-level keys) and the rules the schema states only in prose:
+`validate` enforces the JSON Schema rules (required fields, enums, budget bounds, tool-ref and scope patterns, strict integers, no unknown top-level keys or `guards` keys) and the rules the schema states only in prose:
 
 - `graph` is allowed only for `kind: workflow`, and a workflow needs vertices;
-- vertex ids are unique and edges reference existing vertices;
+- `agent` (the tool loop settings, `max_turns`) is allowed only for `kind: agent`;
+- vertex ids are unique, and edges and `graph.entry` reference existing vertices;
 - every loop contains a vertex with `max_iterations`.
 
-`lint` warns about unknown nested keys, MCP tools not pinned with `#sha256:`, node tools not pinned with `@vN`, and write tools without an injection defence. See [`tests/fixtures/invoice-triage.node.yaml`](tests/fixtures/invoice-triage.node.yaml) for a full example. Once created, a node is called from the data plane with `caliban={"node": "invoice-triage"}`. The node design is described in [research note 04](https://github.com/thecalibanproject/docs/blob/main/research/04-agent-orchestration.md).
+Tool refs are `mcp://server/tool#sha256:<hash>`, `node://name@vN` or `builtin://datasource_query`. `budgets.usd` caps what one run may spend on model calls; `guards` sets the loop guard (`max_repeats`, default 3) and transient tool retries (`tool_retries`, default 2).
+
+`lint` warns about unknown nested keys, MCP tools not pinned with `#sha256:`, node tools not pinned with `@vN`, unknown or write-effect `builtin://` tools, `builtin://datasource_query` without `datasources.scopes`, `allow_tainted` on a read tool, `code` vertices (core refuses them at publish), and write tools without an injection defence. See [`tests/fixtures/invoice-triage.node.yaml`](tests/fixtures/invoice-triage.node.yaml) for a full example. Once created, a node is called from the data plane with `caliban={"node": "invoice-triage"}`. The node design is described in [research note 04](https://github.com/thecalibanproject/docs/blob/main/research/04-agent-orchestration.md).
 
 ### Evals (golden sets, pass^k)
 
