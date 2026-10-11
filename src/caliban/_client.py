@@ -377,7 +377,7 @@ class Caliban:
             between chunks. Default 600s total, 10s connect.
         max_retries: Retries on 429/503 and connect failures (default 2). A POST is not
             retried on 502 unless it carries an ``Idempotency-Key`` header (pass it in
-            ``extra_headers``); the gateway does not deduplicate on that key yet.
+            ``extra_headers``); the gateway deduplicates on that key.
         http_client: Bring your own ``httpx.Client`` (custom CA, proxies, mTLS).
     """
 

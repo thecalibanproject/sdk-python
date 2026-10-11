@@ -103,6 +103,9 @@ class Trial(BaseModel):
     run_status: str | None = None
     """Node targets: how the run ended (``succeeded``, ``failed``, ``budget_exhausted``,
     ``cancelled``)."""
+    input_labels: list[str] | None = None
+    """Node targets: taint labels the run input carried from the start (``caller`` when it
+    held untrusted caller data)."""
 
 
 class CaseResult(BaseModel):
@@ -245,6 +248,7 @@ class _NodeRun(BaseModel):
     budget: dict[str, Any] = Field(default_factory=dict)
     cost_usd: float | None = None
     usage: CompletionUsage | None = None
+    input_labels: list[str] | None = None
 
 
 _RUN = TypeAdapter(_NodeRun)
@@ -324,6 +328,9 @@ def _run_node_trial(
         body = {"chat": {"messages": case.build_messages(dataset.defaults.system)}}
     if version is not None:
         body["version"] = version
+    untrusted = case.untrusted if case.untrusted is not None else dataset.defaults.untrusted
+    if untrusted is not None:
+        body["untrusted"] = untrusted
     # The run API deduplicates on the key, so a retried request never starts a second run.
     headers = {"Idempotency-Key": _idempotency_key(cfg, case, index)}
     t0 = time.perf_counter()
@@ -379,6 +386,7 @@ def _run_node_trial(
         routed_model=f"node/{run.node or name}@v{run.version}" if run.version else None,
         run_id=run.id,
         run_status=run.status,
+        input_labels=run.input_labels,
     )
 
 
@@ -487,6 +495,10 @@ def run_eval(
         warnings.append("no cost data (the server sent no cost; pass pricing=...).")
     d = dataset.defaults
     runs_nodes = target.node is not None or any(c.node for c in dataset.cases)
+    if not runs_nodes and (
+        d.untrusted is not None or any(c.untrusted is not None for c in dataset.cases)
+    ):
+        warnings.append("untrusted applies to node targets only; a model target ignores it.")
     if runs_nodes and (
         d.temperature is not None
         or d.max_tokens is not None

@@ -22,6 +22,7 @@
       - id: structured                         # node targets: input is the run input
         input: { invoice_id: 42 }              # any JSON, as in core golden sets
         answers: { clarify: "yes" }            # scripted answers to human steps
+        untrusted: ["/note"]                   # untrusted caller data (or true)
         expected: "approve"
 
 For a node target, ``input`` is sent as the run input as is (``POST /v1/nodes/{name}/runs``),
@@ -41,7 +42,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from ..errors import CalibanError
-from ..types import CalibanOptions, ChatMessage
+from ..types import CalibanOptions, ChatMessage, Untrusted
 
 __all__ = [
     "AnyCheck",
@@ -145,6 +146,9 @@ class Case(_Strict):
     """Node targets: scripted answers to human steps, by step id (``clarify#0``,
     ``write#0@approve``) or vertex id (``clarify``, ``write@approve``). A question without an
     answer cancels the run and fails the trial; an approval without one is denied."""
+    untrusted: Untrusted | None = None
+    """Node targets: the input the caller marks as untrusted data (``true`` or JSON pointers),
+    sent as ``untrusted`` on the run; overrides ``defaults.untrusted``."""
     node: str | None = None
     """Per-case node override (``name`` or ``name@vN``)."""
     caliban: CalibanOptions | None = None
@@ -203,6 +207,8 @@ class DatasetDefaults(_Strict):
     temperature: float | None = None
     max_tokens: int | None = None
     caliban: CalibanOptions | None = None
+    untrusted: Untrusted | None = None
+    """Node targets: the default ``untrusted`` marks of every case."""
 
 
 class Dataset(_Strict):

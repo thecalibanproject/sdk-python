@@ -668,3 +668,32 @@ def test_cli_node_target(
     with pytest.raises(SystemExit):
         cli.main([*argv, "--model", "m"])  # --model and --node are exclusive
     assert "not allowed with" in capsys.readouterr().err
+
+
+def test_node_trial_untrusted_marks_and_input_labels(tmp_path: Path) -> None:
+    p = tmp_path / "ds.yaml"
+    p.write_text(
+        "name: u\ndefaults: {node: geo-node, untrusted: true}\n"
+        "cases:\n"
+        "  - {id: all, input: {note: x}, expected: ok}\n"
+        "  - {id: field, input: {note: x}, untrusted: ['/note'], expected: ok}\n"
+        "  - {id: none, input: {note: x}, untrusted: false, expected: ok}\n"
+    )
+    bodies: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        bodies.append(body)
+        labels = [] if body["untrusted"] is False else ["caller"]
+        return httpx.Response(200, json=run_body(input_labels=labels))
+
+    report = run_eval(load_dataset(p), make_client(handler), k=1)
+    assert [b["untrusted"] for b in bodies] == [True, ["/note"], False]
+    assert [c.trials[0].input_labels for c in report.cases] == [["caller"], ["caller"], []]
+
+    model_ds = load_dataset(p)
+    model_ds.defaults.node = None
+    model_ds.defaults.model = "m"
+    ok = completion_body("ok")
+    chat = run_eval(model_ds, make_client(lambda r: httpx.Response(200, json=ok)), k=1)
+    assert any("node targets only" in w for w in chat.warnings)

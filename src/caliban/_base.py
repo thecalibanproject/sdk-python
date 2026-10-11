@@ -12,8 +12,10 @@ Retry policy
 * Connection failures where the request provably never reached the server
   (``ConnectError``/``ConnectTimeout``) are always retryable. Other transport
   errors (read timeouts, resets) are retried only for idempotent requests.
-* The gateway does not deduplicate on ``Idempotency-Key`` yet. The header is sent
-  only when the caller sets it.
+* The header is sent only when the caller sets it (the eval runner sets one per node
+  trial). The gateway deduplicates on it for chat completions, messages, embeddings,
+  rerank and node runs (``POST /v1/nodes/{name}/runs``), so a retry gets the first
+  request's result instead of running it again. The admin API does not deduplicate.
 """
 
 from __future__ import annotations

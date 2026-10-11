@@ -80,6 +80,7 @@ Every data-plane request body can carry a `caliban` object. Clients that do not 
 | `reasoning` | `off`, `low`, `medium`, `high` | Reasoning effort, translated for the model family (see [Reasoning models](#reasoning-models)). |
 | `zdr` | `bool` | Zero data retention. |
 | `trace_id` | `str` | Your own correlation id. |
+| `untrusted` | `bool`, or up to 64 JSON pointers (`"/email/body"`, `""` for all) | With `model="node/<name>"` (or `caliban/auto` handing the request to a node): the node input the caller marks as untrusted data. The run input then carries the `caller` taint label, so a write its data reaches needs an `allow_tainted` entry or a human approval. |
 
 ```python
 from caliban import CalibanOptions
@@ -417,7 +418,7 @@ print(spec.to_yaml())
 
 Tool refs are `mcp://server/tool#sha256:<hash>`, `node://name@vN` or `builtin://datasource_query`. `budgets.usd` caps what one run may spend on model calls; `guards` sets the loop guard (`max_repeats`, default 3) and transient tool retries (`tool_retries`, default 2).
 
-`lint` warns about unknown nested keys, MCP tools not pinned with `#sha256:`, node tools not pinned with `@vN`, unknown or write-effect `builtin://` tools, `builtin://datasource_query` without `datasources.scopes`, `allow_tainted` on a built-in or node read tool (it applies to writes and to MCP reads that reach the network), `code` vertices (core refuses them at publish), and write tools without an injection defence. See [`tests/fixtures/invoice-triage.node.yaml`](tests/fixtures/invoice-triage.node.yaml) for a full example. Once published, a node is called from the data plane with `model="node/invoice-triage"` (the live version) or `model="node/invoice-triage@v3"` on chat completions, or through the run API (`POST /v1/nodes/{name}/runs`). The `caliban.node` field does not run a node. The node design is described in [research note 04](https://github.com/thecalibanproject/docs/blob/main/research/04-agent-orchestration.md).
+`lint` warns about unknown nested keys, MCP tools not pinned with `#sha256:`, node tools not pinned with `@vN`, unknown or write-effect `builtin://` tools, `builtin://datasource_query` without `datasources.scopes`, `allow_tainted` on a built-in or node read tool (it applies to writes and to MCP reads that reach the network), `code` vertices (core refuses them at publish), and write tools without an injection defence. See [`tests/fixtures/invoice-triage.node.yaml`](tests/fixtures/invoice-triage.node.yaml) for a full example. Once published, a node is called from the data plane with `model="node/invoice-triage"` (the live version) or `model="node/invoice-triage@v3"` on chat completions, or through the run API (`POST /v1/nodes/{name}/runs`). The `caliban.node` field does not run a node. To mark input fields as untrusted caller data whoever calls, put `"x-caliban-untrusted": true` on them in `prompt.input_schema`; a caller marks more with `caliban.untrusted` (or `untrusted` on the run API). The node design is described in [research note 04](https://github.com/thecalibanproject/docs/blob/main/research/04-agent-orchestration.md).
 
 ### Evals (golden sets, pass^k)
 
@@ -481,6 +482,7 @@ A node target (`--node name`, `--node name@vN`, `node:` in the dataset defaults 
 - `input` is the run input as is (any JSON, as in core golden sets); `messages` go through the node's chat mapping.
 - A trial passes when the run succeeds and every check passes. A run that fails, exhausts its budget or is cancelled fails the trial, and its cost counts.
 - `answers` script human steps, by step id (`clarify#0`, `write#0@approve`) or vertex id (`clarify`, `write@approve`). A question without an answer cancels the run and fails the trial; an approval without one is denied.
+- `untrusted` (in the defaults or per case: `true`, or JSON pointers into the input) is sent on the run to mark untrusted caller data; each trial reports the run's `input_labels` (`caller` when marked data was present).
 - A run still going after `--run-timeout` seconds (default 600) is cancelled and counted as an error.
 - `temperature`, `max_tokens` and `caliban` do not apply: the node's spec decides. The report warns when they are set.
 

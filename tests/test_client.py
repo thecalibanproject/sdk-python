@@ -515,3 +515,28 @@ def test_contract_mismatch_raises_typed_error() -> None:
     bad_chunk = make_client(lambda r: httpx.Response(200, content=sse_body('{"choices": []}')))
     with pytest.raises(caliban.APIResponseValidationError):
         list(bad_chunk.chat.completions.create(model="m", messages=[], stream=True))
+
+
+def test_caliban_untrusted_option() -> None:
+    from pydantic import ValidationError
+
+    from caliban import CalibanOptions
+
+    seen: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, json=completion_body())
+
+    client = make_client(handler)
+    client.chat.completions.create(
+        model="node/triage",
+        messages=[{"role": "user", "content": "hi"}],
+        caliban={"untrusted": ["/email/body", ""]},
+    )
+    assert seen[-1]["caliban"] == {"untrusted": ["/email/body", ""]}
+    assert CalibanOptions(untrusted=True).to_body() == {"untrusted": True}
+    with pytest.raises(ValidationError):
+        CalibanOptions(untrusted=["email"])  # a JSON pointer starts with '/'
+    with pytest.raises(ValidationError):
+        CalibanOptions(untrusted=[f"/f{i}" for i in range(65)])

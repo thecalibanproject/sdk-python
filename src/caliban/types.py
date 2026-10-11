@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 import re
 from collections.abc import Mapping
-from typing import Any, Literal, cast
+from typing import Annotated, Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
@@ -44,6 +44,7 @@ __all__ = [
     "Role",
     "RouteStage",
     "TrustTier",
+    "Untrusted",
 ]
 
 PiiMode = Literal["off", "mask", "reversible"]
@@ -55,6 +56,10 @@ RouteStage = Literal["rules", "knn", "keyword"]
 """Routing stage that decided the intent: ``rules`` (pinned model), ``knn`` or ``keyword``."""
 Role = Literal["system", "developer", "user", "assistant", "tool"]
 ReasoningEffort = Literal["off", "low", "medium", "high"]
+Untrusted = bool | Annotated[list[Annotated[str, Field(pattern=r"^(/.*)?$")]], Field(max_length=64)]
+"""Untrusted caller data (taint label ``caller``): ``True`` marks the whole node input,
+``False`` nothing, a list marks fields by JSON pointer (RFC 6901; ``""`` is the whole
+input)."""
 """``caliban.reasoning``. Mapped per model family (Qwen3 ``enable_thinking``,
 ``reasoning_effort``); ``off`` disables thinking on hybrid models."""
 TrustTier = Literal["t0_sovereign", "t1_attested", "t2_contracted", "t3_public"]
@@ -81,6 +86,10 @@ class CalibanOptions(BaseModel):
     """How hard a reasoning model should think (``off|low|medium|high``)."""
     zdr: bool | None = None
     trace_id: str | None = None
+    untrusted: Untrusted | None = None
+    """``model="node/<name>"`` (and ``caliban/auto`` handing the request to a node): the node
+    input the caller marks as untrusted data, ``True`` or JSON pointers into the node's input.
+    A write its data reaches then needs an ``allow_tainted`` entry or a human approval."""
 
     def to_body(self) -> dict[str, Any]:
         """Serialize, dropping unset fields so server-side defaults apply."""
