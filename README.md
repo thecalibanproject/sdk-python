@@ -278,7 +278,7 @@ print(admin.usage.get(tenant_id=t.id, limit=100).totals)
 | `datasources` | `list`, `create`, `delete`, `introspect` |
 | `ontology` | `get`, `review`, `approve`, `reject` |
 | `nodes` | `list`, `create` (validates `spec` locally first; `validate_spec=False` skips that), `delete` |
-| `evals` | `get_golden_set`, `put_golden_set`, `delete_golden_set`, `get_policy`, `set_policy`, `start`, `list`, `get`, `cancel`, `wait`, `gate` (see [Server-side evals](#server-side-evals-and-the-promotion-gate)) |
+| `evals` | `get_golden_set`, `put_golden_set`, `delete_golden_set`, `get_policy`, `set_policy`, `start`, `list`, `get`, `cancel`, `wait`, `gate`, `get_key`, `rotate_key` (see [Server-side evals](#server-side-evals-and-the-promotion-gate)) |
 | `usage` | `get` (`limit` between 1 and 1000) |
 
 The constructor takes `token`, `base_url`, `timeout` (default 30 s), `max_retries`, `default_headers` and `http_client`. GET and DELETE requests retry on 429, 502 and 503. POST and PATCH requests retry only on 429 and 503, because a 502 may mean the server already acted (see [Retries](#retries)). The response models live in `caliban.admin.models`.
@@ -538,15 +538,17 @@ admin.evals.set_policy(
 
 # The version is published with {"promote": false}, evaluated, then promoted.
 for suite in ("golden", "injection"):
-    e = admin.evals.start("acme", "triage", 3, suite=suite, api_key_id="key_evals")
+    e = admin.evals.start("acme", "triage", 3, suite=suite)
     e = admin.evals.wait("acme", e.id, timeout_s=1800)
-    print(suite, e.status, e.summary)
+    print(suite, e.status, e.summary)  # a GoldenSummary or an InjectionSummary
 
 gate = admin.evals.gate("acme", "triage", 3)
 print(gate.allowed, gate.evidence, [p.message for p in gate.problems])
 ```
 
-- `start` takes `api_key_id`, the tenant API key the eval's runs are made, limited and metered as. Core requires it today; it is moving to a control-plane-managed per-tenant eval key, after which the argument can be left out (the SDK sends it only when set).
+- Evals run as the tenant's eval key: an API key the control plane creates on the first eval that names no key and manages itself (its plaintext never leaves the control plane; the data plane refuses it). The eval's runs and judge calls are limited and metered as that key. `get_key` shows it (`purpose="eval"`), `rotate_key` replaces it (rotate between evals: evals in flight lose their key), and `api_keys.revoke` refuses it with a `409`. Pass `api_key_id` to `start` to run an eval as a customer API key instead.
+- `summary` is typed by suite (`GoldenSummary`: pass^k, cost per success, latency, per case; `InjectionSummary`: pass rate, attack success rate, utility under attack, per category), and so is each trial's `verdict` (`GoldenVerdict`, `InjectionVerdict`, or `TrialError` when its run could not be created). `content_purged` says run retention cleared the trials' `detail`; summaries and verdicts stay.
+- `gate` returns typed `evidence` (with each pinned subnode's own evidence under `subnodes`) and `problems`; a problem's `path` names a subnode whose own gate failed.
 - `get_golden_set` returns the cases only to a caller with `runs.data` (`content_visible`); `evals.get` returns the trials, with their `detail` under the same permission.
 - `set_policy` replaces the whole bar: leaving `golden` out removes the golden gate, and an injection eval stays required for versions with write tools whatever `injection` says.
 - `list` pages with `cursor`/`next_cursor`; `status` takes one status or a list.

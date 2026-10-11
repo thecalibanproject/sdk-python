@@ -8,7 +8,7 @@ typos are caught client-side.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -26,23 +26,39 @@ __all__ = [
     "DatasourceKind",
     "DatasourceStatus",
     "Eval",
+    "EvalKey",
+    "EvalKeyRotation",
     "EvalList",
     "EvalPolicy",
-    "EvalPolicyInfo",
+    "EvalPolicyView",
     "EvalStart",
     "EvalStatus",
     "EvalSuite",
+    "EvalSummary",
     "EvalTrial",
     "EvalTrialStatus",
     "GateCheck",
-    "GateProblem",
+    "GateEvidence",
     "GoldenBar",
     "GoldenCase",
+    "GoldenCaseSummary",
+    "GoldenEvidence",
     "GoldenSet",
     "GoldenSetPut",
+    "GoldenSummary",
+    "GoldenVerdict",
     "Health",
     "InjectionBar",
+    "InjectionCaseResult",
+    "InjectionCategory",
+    "InjectionCategoryName",
+    "InjectionDefense",
+    "InjectionEvidence",
+    "InjectionSummary",
+    "InjectionVerdict",
     "IntrospectJob",
+    "JudgeInfo",
+    "LatencyPercentiles",
     "Model",
     "ModelCapabilities",
     "ModelCreate",
@@ -50,6 +66,7 @@ __all__ = [
     "ModelKind",
     "Node",
     "NodeCreate",
+    "NotApplicable",
     "Ontology",
     "OntologyElement",
     "OntologyElementKind",
@@ -58,11 +75,14 @@ __all__ = [
     "OntologyReview",
     "PiiMode",
     "PiiSurrogateScope",
+    "Problem",
+    "ProblemKind",
     "ProviderHealth",
     "ProviderKey",
     "ProviderKeyCreate",
     "ProviderKind",
     "RouteStage",
+    "RunStatus",
     "SemanticCacheSetting",
     "SharedProvider",
     "SharedProviderCreate",
@@ -70,10 +90,12 @@ __all__ = [
     "TenantCreate",
     "TenantStatus",
     "TenantUpdate",
+    "TrialError",
     "TrustTier",
     "UsageEvent",
     "UsageReport",
     "UsageTotals",
+    "VerdictCheck",
 ]
 
 PiiMode = Literal["off", "mask", "reversible"]
@@ -114,6 +136,37 @@ OntologyProvenance = Literal["introspect", "profile", "query_log", "llm", "human
 EvalSuite = Literal["golden", "injection"]
 EvalStatus = Literal["pending", "running", "succeeded", "failed", "cancelled"]
 EvalTrialStatus = Literal["running", "passed", "failed", "error"]
+RunStatus = Literal[
+    "pending",
+    "running",
+    "sleeping",
+    "input_required",
+    "succeeded",
+    "failed",
+    "budget_exhausted",
+    "cancelled",
+]
+InjectionCategoryName = Literal[
+    "tainted_write",
+    "exfiltration",
+    "pii_leak",
+    "tool_poisoning",
+    "replay",
+    "subnode",
+    "caller_data",
+]
+InjectionDefense = Literal["approval_required", "pii_guard", "declared_tools_only", "manifest_scan"]
+ProblemKind = Literal[
+    "spec",
+    "tool",
+    "datasource_scope",
+    "budget",
+    "node_ref",
+    "cycle",
+    "eval_gate",
+    "golden_set",
+    "allowlist",
+]
 
 
 class _Response(BaseModel):
@@ -181,6 +234,9 @@ class ApiKeyInfo(_Response):
     created_at: datetime
     revoked_at: datetime | None = None
     """Set once the key is revoked (listed only with ``include_revoked=True``)."""
+    purpose: Literal["eval"] | None = None
+    """``"eval"``: the tenant's eval key, managed by the control plane (it cannot be revoked
+    through ``api_keys.revoke``; rotate it with ``evals.rotate_key``)."""
 
 
 class ApiKeyCreated(ApiKeyInfo):
@@ -539,14 +595,14 @@ class EvalPolicy(_Request):
     injection: InjectionBar | None = None
 
 
-class EvalPolicyInfo(_Response):
-    """``GET``/``PUT .../nodes/{name}/eval-policy``."""
+class EvalPolicyView(_Response):
+    """``GET``/``PUT .../nodes/{name}/eval-policy`` (``components.schemas.EvalPolicyView``)."""
 
-    object: str | None = None
-    node: str | None = None
-    policy: EvalPolicy = Field(default_factory=EvalPolicy)
-    injection_bar: float | None = None
-    """The injection bar in effect for versions with write tools."""
+    object: str
+    node: str
+    policy: EvalPolicy
+    injection_bar: float
+    """The injection bar in effect for versions with write tools (default 1)."""
     updated_at: datetime | None = None
     updated_by: str | None = None
 
@@ -567,9 +623,8 @@ class EvalStart(_Request):
 
     suite: EvalSuite
     api_key_id: str | None = None
-    """The tenant API key the eval's runs and judge calls are made, limited and metered as.
-    Required by core today; core is moving to a control-plane-managed per-tenant eval key,
-    after which it can be left out."""
+    """Optional: a customer API key to run the eval as (it must be active and allowed to run
+    the node). Absent: the tenant's eval key, which the control plane creates and manages."""
     k: int | None = Field(default=None, ge=1, le=10)
     concurrency: int | None = Field(default=None, ge=1, le=16)
     cases: list[str] | None = None
@@ -582,6 +637,132 @@ class EvalStart(_Request):
     """Injection: take the input (and its checks) from this golden case."""
 
 
+class LatencyPercentiles(_Response):
+    p50: int | None = None
+    """Nearest rank, ms."""
+    p95: int | None = None
+
+
+class GoldenCaseSummary(_Response):
+    case: str
+    trials: int
+    passed: int
+    all_passed: bool
+
+
+class JudgeInfo(_Response):
+    """The judge configuration an eval ran with, so scores compare under the same judge."""
+
+    default_model: str | None = None
+    prompt_version: int | None = None
+    prompt_sha256: str | None = None
+    temperature: float | None = None
+
+
+class GoldenSummary(_Response):
+    """Metrics of a finished golden eval (``components.schemas.GoldenSummary``)."""
+
+    suite: Literal["golden"]
+    k: int
+    cases: int
+    trials: int
+    passed_trials: int
+    errors: int
+    pass_hat_k: float
+    """pass^k: the share of cases whose k runs all passed."""
+    pass_at_1: float
+    pass_at_k: float
+    cost_usd: float
+    cost_per_success_usd: float | None = None
+    """``None`` without a success."""
+    judge_cost_usd: float
+    tokens: int
+    latency_ms: LatencyPercentiles
+    by_case: list[GoldenCaseSummary]
+    golden_hash: str | None = None
+    judge: JudgeInfo | None = None
+
+
+class InjectionCategory(_Response):
+    trials: int
+    blocked: int
+    pass_rate: float
+
+
+class NotApplicable(_Response):
+    case: str
+    reason: str
+
+
+class InjectionCaseResult(_Response):
+    case: str
+    trial: int
+    blocked: bool
+    attacked: bool | None = None
+    defenses: list[str] | None = None
+    run_id: str | None = None
+
+
+class InjectionSummary(_Response):
+    """Metrics of a finished injection eval (``components.schemas.InjectionSummary``)."""
+
+    suite: Literal["injection"]
+    suite_version: int
+    trials: int
+    blocked: int
+    pass_rate: float
+    """Share of attacks blocked."""
+    attack_success_rate: float
+    attacks_succeeded: int
+    errors: int
+    attacked: int
+    """Trials where the model followed the injection."""
+    utility_under_attack: float
+    """Share of runs that still did their job."""
+    by_category: dict[str, InjectionCategory]
+    not_applicable: list[NotApplicable]
+    cost_usd: float
+    latency_ms: LatencyPercentiles
+    cases: list[InjectionCaseResult]
+
+
+EvalSummary = Annotated[GoldenSummary | InjectionSummary, Field(discriminator="suite")]
+
+
+class VerdictCheck(_Response):
+    type: Literal["exact", "contains", "regex", "json_schema", "llm_judge"]
+    passed: bool
+    score: float | None = None
+    """The judge's score (``llm_judge``)."""
+
+
+class GoldenVerdict(_Response):
+    run_status: RunStatus
+    checks: list[VerdictCheck]
+    judge_usd: float | None = None
+
+
+class InjectionVerdict(_Response):
+    case: str
+    category: InjectionCategoryName
+    succeeded: bool
+    """The attack reached its goal."""
+    attacked: bool
+    """The model followed the injection."""
+    defenses: list[InjectionDefense]
+    tool_calls: int
+    """Sandboxed calls of the run."""
+    utility: bool | None = None
+    """The run still did its job (absent for the manifest scan)."""
+    run_status: RunStatus | None = None
+
+
+class TrialError(_Response):
+    """The verdict of a trial whose run could not be created."""
+
+    error: str
+
+
 class EvalTrial(_Response):
     case: str | None = None
     trial: int | None = None
@@ -590,12 +771,11 @@ class EvalTrial(_Response):
     cost_usd: float | None = None
     latency_ms: int | None = None
     tokens: int | None = None
-    verdict: dict[str, Any] | None = None
-    """Metadata: checks passed (golden); category, attacked, succeeded, defenses, utility
-    (injection)."""
+    verdict: TrialError | GoldenVerdict | InjectionVerdict | None = None
+    """Metadata, never content; the shape follows the eval's suite."""
     detail: Any = None
     """With ``runs.data`` only: the output and what the scorers said, or what the sandboxed
-    tools received."""
+    tools received. ``None`` once run retention purged it (``Eval.content_purged``)."""
     finished_at: datetime | None = None
 
 
@@ -614,16 +794,16 @@ class Eval(_Response):
     status: EvalStatus
     created_by: str | None = None
     api_key_id: str | None = None
-    summary: dict[str, Any] | None = None
-    """Metrics only. Golden: ``pass_hat_k``, ``pass_at_1``, ``pass_at_k``, ``cost_usd``,
-    ``cost_per_success_usd``, ``judge_cost_usd``, ``latency_ms`` (``p50``, ``p95``),
-    ``by_case``, ``golden_hash``, ``judge``, ... Injection: ``pass_rate``,
-    ``attack_success_rate``, ``attacked``, ``utility_under_attack``, ``by_category``,
-    ``not_applicable``, ..."""
+    summary: EvalSummary | None = None
+    """Metrics only, never content; ``None`` until the eval ends. A :class:`GoldenSummary` or
+    an :class:`InjectionSummary`, following ``suite``."""
     error: str | None = None
     cancel_requested: bool | None = None
     cancelled_by: str | None = None
     claims: int | None = None
+    content_purged: bool | None = None
+    """Run retention cleared the eval's sealed content (trial ``detail``, the plan); the
+    summary and verdicts stay."""
     created_at: datetime
     started_at: datetime | None = None
     finished_at: datetime | None = None
@@ -642,11 +822,38 @@ class EvalList(_Response):
     next_cursor: str | None = None
 
 
-class GateProblem(_Response):
-    kind: str
-    """``eval_gate`` for a bar the version's evals do not meet."""
+class Problem(_Response):
+    """A reason a node version is refused (``components.schemas.Problem``)."""
+
+    kind: ProblemKind
+    """``eval_gate`` for a bar the version's evals do not meet; ``allowlist`` only in
+    warnings."""
     message: str
     path: str | None = None
+    """Where in the spec; for ``eval_gate``, the subnode (``node://<child>@v<N>``) whose own
+    gate failed."""
+
+
+class GoldenEvidence(_Response):
+    eval: str
+    k: int
+    pass_hat_k: float
+
+
+class InjectionEvidence(_Response):
+    eval: str
+    pass_rate: float
+    bar: float
+
+
+class GateEvidence(_Response):
+    """The evals that met the bar (``components.schemas.GateEvidence``)."""
+
+    golden: GoldenEvidence | None = None
+    injection: InjectionEvidence | None = None
+    subnodes: dict[str, GateEvidence | None] | None = None
+    """Per pinned subnode version (``name@vN``): its own evidence, or ``None`` when no gate
+    applies to it."""
 
 
 class GateCheck(_Response):
@@ -656,7 +863,24 @@ class GateCheck(_Response):
     version: int | None = None
     has_write_tools: bool | None = None
     allowed: bool
-    evidence: dict[str, Any] | None = None
-    """The evals that meet the bar (``golden``, ``injection``); ``None`` when no gate
-    applies."""
-    problems: list[GateProblem] = Field(default_factory=list)
+    evidence: GateEvidence | None = None
+    """The evals that meet the bar; ``None`` when no gate applies."""
+    problems: list[Problem] = Field(default_factory=list)
+    """Every reason it cannot be promoted."""
+
+
+class EvalKey(_Response):
+    """``GET /api/v1/tenants/{tenantId}/eval-key``."""
+
+    tenant_id: str
+    key: ApiKeyInfo | None = None
+    """``None`` before the tenant's first eval that names no key."""
+
+
+class EvalKeyRotation(_Response):
+    """``POST /api/v1/tenants/{tenantId}/eval-key/rotate``."""
+
+    tenant_id: str
+    key: ApiKeyInfo
+    revoked: str | None = None
+    """The id of the key it replaced."""

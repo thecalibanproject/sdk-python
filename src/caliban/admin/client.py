@@ -30,9 +30,11 @@ from .models import (
     DatasourceCreate,
     DatasourceKind,
     Eval,
+    EvalKey,
+    EvalKeyRotation,
     EvalList,
     EvalPolicy,
-    EvalPolicyInfo,
+    EvalPolicyView,
     EvalStart,
     EvalStatus,
     EvalSuite,
@@ -225,7 +227,8 @@ class ApiKeys(_Resource):
         A standalone deployment rejects it on the next request; a split-mode router
         rejects it after its next snapshot poll (10 s by default). Raises
         :class:`~caliban.NotFoundError` if the key is unknown, belongs to another tenant
-        or is already revoked.
+        or is already revoked, and :class:`~caliban.ConflictError` for the tenant's eval key
+        (``purpose="eval"``; rotate it with ``admin.evals.rotate_key``).
         """
         self._delete(f"tenants/{_p(tenant_id)}/api-keys/{_p(key_id)}")
 
@@ -516,10 +519,10 @@ class Evals(_Resource):
 
     # the promotion bar
 
-    def get_policy(self, tenant_id: str, node: str) -> EvalPolicyInfo:
+    def get_policy(self, tenant_id: str, node: str) -> EvalPolicyView:
         """The node's promotion bar, and the injection bar in effect for versions with write
         tools."""
-        return self._one(EvalPolicyInfo, self._get(f"{self._node(tenant_id, node)}/eval-policy"))
+        return self._one(EvalPolicyView, self._get(f"{self._node(tenant_id, node)}/eval-policy"))
 
     def set_policy(
         self,
@@ -528,7 +531,7 @@ class Evals(_Resource):
         *,
         golden: GoldenBar | Mapping[str, Any] | None = None,
         injection: InjectionBar | Mapping[str, Any] | None = None,
-    ) -> EvalPolicyInfo:
+    ) -> EvalPolicyView:
         """Replace the node's promotion bar (``PUT``; needs ``nodes.publish``; audited).
 
         ``golden`` gates promotion on the version's latest golden eval; leaving it out removes
@@ -538,7 +541,7 @@ class Evals(_Resource):
         """
         body = EvalPolicy.model_validate({"golden": golden, "injection": injection}).to_body()
         resp = self._put(f"{self._node(tenant_id, node)}/eval-policy", body)
-        return self._one(EvalPolicyInfo, resp)
+        return self._one(EvalPolicyView, resp)
 
     # evals
 
@@ -564,9 +567,10 @@ class Evals(_Resource):
         sandboxed tools (``k`` default 1) with ``input``, or the input of ``input_case`` (else
         the golden set's first case).
 
-        ``api_key_id`` names the tenant API key the eval's runs are made, limited and metered
-        as; core requires it today. Core is moving to a control-plane-managed per-tenant eval
-        key, after which it can be left out (``None`` is not sent).
+        The eval's runs and judge calls are made, limited and metered as the tenant's eval
+        key, which the control plane creates on the first eval that names no key and manages
+        itself (see :meth:`get_key`). ``api_key_id`` runs the eval as a customer API key
+        instead (it must be active and allowed to run the node); ``None`` is not sent.
         """
         body = EvalStart(
             suite=suite,
@@ -634,9 +638,23 @@ class Evals(_Resource):
                 raise CalibanError(f"eval {eval_id} still {e.status} after {timeout_s:g}s")
             _base._sleep(poll_s)
 
+    # the eval key
+
+    def get_key(self, tenant_id: str) -> EvalKey:
+        """The tenant's eval key (metadata only; its plaintext never leaves the control
+        plane). ``key`` is ``None`` before the first eval that names no key. Needs
+        ``api_keys.read``."""
+        return self._one(EvalKey, self._get(f"tenants/{_p(tenant_id)}/eval-key"))
+
+    def rotate_key(self, tenant_id: str) -> EvalKeyRotation:
+        """Revoke the eval key and create a new one (``api_keys.write``; audited). Evals in
+        flight lose their key, so rotate between evals."""
+        return self._one(EvalKeyRotation, self._post(f"tenants/{_p(tenant_id)}/eval-key/rotate"))
+
     def gate(self, tenant_id: str, node: str, version: int) -> GateCheck:
         """What promoting the version would say: ``allowed``, the evals that meet the bar
-        (``evidence``) or the ``problems``."""
+        (``evidence``, with each pinned subnode's under ``subnodes``) or the ``problems``
+        (a ``path`` names a subnode whose own gate failed)."""
         return self._one(GateCheck, self._get(f"{self._version(tenant_id, node, version)}/gate"))
 
 

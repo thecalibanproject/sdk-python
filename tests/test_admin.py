@@ -748,7 +748,7 @@ def test_eval_policy(admin: CalibanAdmin) -> None:
     view = {
         "object": "node.eval_policy",
         "node": "triage",
-        "policy": {"golden": {"min_pass_k": 0.9, "min_k": 3, "new_bar": 1}},
+        "policy": {"golden": {"min_pass_k": 0.9, "min_k": 3, "new_bar": 1}, "other": {}},
         "injection_bar": 1.0,
         "updated_at": TS,
         "updated_by": "admin",
@@ -785,15 +785,39 @@ def test_start_list_get_cancel_and_gate(admin: CalibanAdmin) -> None:
         "cost_usd": 0.001,
         "latency_ms": 900,
         "tokens": 120,
-        "verdict": {"checks": [{"type": "contains", "passed": True}]},
+        "verdict": {
+            "run_status": "succeeded",
+            "checks": [{"type": "contains", "passed": True, "score": None}],
+            "judge_usd": 0.0,
+        },
         "finished_at": TS,
+    }
+    summary = {
+        "suite": "golden",
+        "k": 3,
+        "cases": 1,
+        "trials": 3,
+        "passed_trials": 3,
+        "errors": 0,
+        "pass_hat_k": 1.0,
+        "pass_at_1": 1.0,
+        "pass_at_k": 1.0,
+        "cost_usd": 0.003,
+        "cost_per_success_usd": 0.001,
+        "judge_cost_usd": 0.0,
+        "tokens": 360,
+        "latency_ms": {"p50": 900, "p95": 950},
+        "by_case": [{"case": "chest", "trials": 3, "passed": 3, "all_passed": True}],
+        "golden_hash": "sha256:ab",
+        "judge": {"default_model": "caliban/auto", "prompt_version": 1, "temperature": 0},
     }
     done = {
         **EVAL,
         "status": "succeeded",
-        "summary": {"pass_hat_k": 1.0, "cost_per_success_usd": 0.001},
-        "trials": [trial],
+        "summary": summary,
+        "trials": [trial, {**trial, "trial": 1, "status": "error", "verdict": {"error": "x"}}],
         "content_visible": False,
+        "content_purged": True,
     }
     r = router(admin)
     start = r.post(f"{NV}/evals").respond(202, json=EVAL)
@@ -812,9 +836,29 @@ def test_start_list_get_cancel_and_gate(admin: CalibanAdmin) -> None:
         "has_write_tools": True,
         "allowed": False,
         "evidence": None,
-        "problems": [{"kind": "eval_gate", "message": "no injection eval"}],
+        "problems": [
+            {"kind": "eval_gate", "message": "no injection eval"},
+            {"kind": "eval_gate", "message": "child gate", "path": "node://kb@v1"},
+        ],
     }
-    r.get(f"{NV}/gate").respond(200, json=gate)
+    r.get(f"{NV}/gate").mock(
+        side_effect=[
+            httpx.Response(200, json=gate),
+            httpx.Response(
+                200,
+                json={
+                    **gate,
+                    "allowed": True,
+                    "problems": [],
+                    "evidence": {
+                        "golden": {"eval": "ev_1", "k": 3, "pass_hat_k": 1.0},
+                        "injection": {"eval": "ev_2", "pass_rate": 1.0, "bar": 1.0},
+                        "subnodes": {"kb@v1": {"golden": None}, "util@v2": None},
+                    },
+                },
+            ),
+        ]
+    )
 
     e = admin.evals.start("t1", "triage", 2, suite="golden", api_key_id="k1", k=3)
     assert e.status == "pending" and not e.done
@@ -823,7 +867,7 @@ def test_start_list_get_cancel_and_gate(admin: CalibanAdmin) -> None:
         "api_key_id": "k1",
         "k": 3,
     }
-    # The eval key is optional: core is moving to a control-plane-managed one.
+    # No api_key_id: core runs the eval as the tenant's control-plane-managed eval key.
     admin.evals.start("t1", "triage", 2, suite="injection", input={"case": "hi"})
     assert json.loads(start.calls.last.request.content) == {
         "suite": "injection",
@@ -848,14 +892,92 @@ def test_start_list_get_cancel_and_gate(admin: CalibanAdmin) -> None:
         admin.evals.list("t1", limit=500)
 
     final = admin.evals.wait("t1", "ev_1", poll_s=0.01)
-    assert final.done and final.summary == {"pass_hat_k": 1.0, "cost_per_success_usd": 0.001}
+    assert final.done and final.content_purged
+    assert isinstance(final.summary, m.GoldenSummary)
+    assert final.summary.cost_per_success_usd == 0.001 and final.summary.latency_ms.p95 == 950
+    assert final.summary.by_case[0].all_passed and final.summary.judge
     assert final.trials and final.trials[0].status == "passed" and final.trials[0].detail is None
+    v0, v1 = (t.verdict for t in final.trials)
+    assert isinstance(v0, m.GoldenVerdict) and v0.checks[0].type == "contains"
+    assert isinstance(v1, m.TrialError) and v1.error == "x"
 
     c = admin.evals.cancel("t1", "ev_1")
     assert c.cancel_requested and cancel.called
 
     g = admin.evals.gate("t1", "triage", 2)
     assert not g.allowed and g.has_write_tools and g.problems[0].kind == "eval_gate"
+    assert g.problems[1].path == "node://kb@v1"
+    g = admin.evals.gate("t1", "triage", 2)
+    assert g.allowed and g.evidence and g.evidence.injection and g.evidence.injection.bar == 1.0
+    assert g.evidence.subnodes is not None and g.evidence.subnodes["util@v2"] is None
+    assert isinstance(g.evidence.subnodes["kb@v1"], m.GateEvidence)
+
+
+def test_injection_summary_and_verdict() -> None:
+    e = m.Eval.model_validate(
+        {
+            **EVAL,
+            "suite": "injection",
+            "status": "succeeded",
+            "summary": {
+                "suite": "injection",
+                "suite_version": 2,
+                "trials": 2,
+                "blocked": 2,
+                "pass_rate": 1.0,
+                "attack_success_rate": 0.0,
+                "attacks_succeeded": 0,
+                "errors": 0,
+                "attacked": 1,
+                "utility_under_attack": 0.5,
+                "by_category": {"caller_data": {"trials": 1, "blocked": 1, "pass_rate": 1.0}},
+                "not_applicable": [{"case": "subnode.child_to_parent", "reason": "no subnode"}],
+                "cost_usd": 0.01,
+                "latency_ms": {"p50": None, "p95": None},
+                "cases": [{"case": "write.staged", "trial": 0, "blocked": True}],
+            },
+            "trials": [
+                {
+                    "case": "write.staged",
+                    "trial": 0,
+                    "status": "passed",
+                    "verdict": {
+                        "case": "write.staged",
+                        "category": "tainted_write",
+                        "succeeded": False,
+                        "attacked": True,
+                        "defenses": ["approval_required"],
+                        "tool_calls": 2,
+                        "utility": True,
+                        "run_status": "succeeded",
+                    },
+                }
+            ],
+        }
+    )
+    assert isinstance(e.summary, m.InjectionSummary)
+    assert e.summary.by_category["caller_data"].pass_rate == 1.0
+    assert e.trials and isinstance(e.trials[0].verdict, m.InjectionVerdict)
+    assert e.trials[0].verdict.defenses == ["approval_required"]
+
+
+def test_eval_key(admin: CalibanAdmin) -> None:
+    info = {"id": "k9", "name": "eval", "prefix": "cal_ev", "created_at": TS, "purpose": "eval"}
+    r = router(admin)
+    r.get("/tenants/t1/eval-key").mock(
+        side_effect=[
+            httpx.Response(200, json={"tenant_id": "t1", "key": None}),
+            httpx.Response(200, json={"tenant_id": "t1", "key": info}),
+        ]
+    )
+    rotate = r.post("/tenants/t1/eval-key/rotate").respond(
+        200, json={"tenant_id": "t1", "key": {**info, "id": "k10"}, "revoked": "k9"}
+    )
+    assert admin.evals.get_key("t1").key is None
+    k = admin.evals.get_key("t1").key
+    assert k is not None and k.purpose == "eval"
+    rot = admin.evals.rotate_key("t1")
+    assert (rot.key.id, rot.revoked) == ("k10", "k9") and rotate.called
 
 
 def test_eval_wait_times_out(admin: CalibanAdmin) -> None:
