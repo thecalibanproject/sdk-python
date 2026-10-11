@@ -87,8 +87,9 @@ class ToolRef(_Open):
     effect: Literal["read", "write"]
     requires: list[str] | None = None
     allow_tainted: list[str] | None = None
-    """``effect: write`` only: taint labels its arguments may carry without a human
-    approval (``tool:<server>/*``, ``datasource``, ``*``)."""
+    """Writes, and reads that reach the network through their arguments: taint labels the
+    arguments may carry without a human approval (``tool:<server>/*``, ``datasource``,
+    ``caller``, ``*``)."""
 
 
 class DatasourceScopes(_Open):
@@ -347,8 +348,17 @@ def lint(spec: NodeSpec) -> list[str]:
                 warnings.append(f"tools[{i}].effect: built-in tools are read only")
             if name == "datasource_query" and not (spec.datasources and spec.datasources.scopes):
                 warnings.append(f"tools[{i}].ref: datasource_query needs datasources.scopes")
-        if tool.allow_tainted is not None and tool.effect != "write":
-            warnings.append(f"tools[{i}].allow_tainted: only applies to effect=write tools")
+        if (
+            tool.allow_tainted is not None
+            and tool.effect != "write"
+            and not tool.ref.startswith("mcp://")
+        ):
+            # An MCP read may reach the network (gated like a write); built-in and node tools
+            # never do.
+            warnings.append(
+                f"tools[{i}].allow_tainted: only applies to writes and to MCP reads that reach "
+                "the network"
+            )
     for i, vertex in enumerate(spec.graph.vertices or [] if spec.graph else []):
         if vertex.type == "code":
             warnings.append(

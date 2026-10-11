@@ -290,6 +290,8 @@ def test_lint_builtin_tools_and_taint() -> None:
                 {"ref": "builtin://datasource_query", "effect": "read"},
                 {"ref": "builtin://shell", "effect": "write"},
                 {"ref": "node://risk@v1", "effect": "read", "allow_tainted": ["*"]},
+                # An MCP read may reach the network, where allow_tainted applies.
+                {"ref": "mcp://web/fetch#sha256:ab", "effect": "read", "allow_tainted": ["caller"]},
             ],
             "guardrails": {"injection_mode": "camel"},
         }
@@ -298,8 +300,31 @@ def test_lint_builtin_tools_and_taint() -> None:
         "tools[0].ref: datasource_query needs datasources.scopes",
         "tools[1].ref: unknown built-in tool (known: builtin://datasource_query)",
         "tools[1].effect: built-in tools are read only",
-        "tools[2].allow_tainted: only applies to effect=write tools",
+        "tools[2].allow_tainted: only applies to writes and to MCP reads that reach the network",
     ]
+
+
+def test_input_schema_untrusted_marks_and_caller_label() -> None:
+    spec = validate(
+        {
+            **MINIMAL,
+            "prompt": {
+                "system": "x",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"email": {"type": "string", "x-caliban-untrusted": True}},
+                },
+            },
+            "tools": [
+                {"ref": "mcp://crm/note#sha256:ab", "effect": "write", "allow_tainted": ["caller"]}
+            ],
+            "guardrails": {"injection_mode": "camel"},
+        }
+    )
+    assert spec.prompt.input_schema is not None
+    assert spec.prompt.input_schema["properties"]["email"]["x-caliban-untrusted"] is True
+    assert lint(spec) == []
+    assert validate(spec.to_dict()) == spec
 
 
 def test_lint_code_vertex() -> None:
