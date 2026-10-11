@@ -12,6 +12,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from ..errors import CalibanError
+from ..evals.dataset import Case
 from ..types import CacheTier, ModelCapabilities, ModelKind, RouteStage, TrustTier
 
 __all__ = [
@@ -23,7 +25,23 @@ __all__ = [
     "DatasourceCreate",
     "DatasourceKind",
     "DatasourceStatus",
+    "Eval",
+    "EvalList",
+    "EvalPolicy",
+    "EvalPolicyInfo",
+    "EvalStart",
+    "EvalStatus",
+    "EvalSuite",
+    "EvalTrial",
+    "EvalTrialStatus",
+    "GateCheck",
+    "GateProblem",
+    "GoldenBar",
+    "GoldenCase",
+    "GoldenSet",
+    "GoldenSetPut",
     "Health",
+    "InjectionBar",
     "IntrospectJob",
     "Model",
     "ModelCapabilities",
@@ -93,6 +111,9 @@ OntologyElementKind = Literal[
 ]
 OntologyElementStatus = Literal["proposed", "approved", "rejected", "stale", "deprecated"]
 OntologyProvenance = Literal["introspect", "profile", "query_log", "llm", "human"]
+EvalSuite = Literal["golden", "injection"]
+EvalStatus = Literal["pending", "running", "succeeded", "failed", "cancelled"]
+EvalTrialStatus = Literal["running", "passed", "failed", "error"]
 
 
 class _Response(BaseModel):
@@ -417,3 +438,225 @@ class UsageTotals(_Response):
 class UsageReport(_Response):
     events: list[UsageEvent]
     totals: UsageTotals
+
+
+# ───────────────────────────── evals ─────────────────────────────
+
+
+def _known_keys(model: type[BaseModel], v: Any) -> Any:
+    # Request models forbid extra keys (to catch typos in user code); a newer server may send
+    # more, so responses keep only the keys this SDK knows.
+    if not isinstance(v, dict):
+        return v
+    return {k: x for k, x in v.items() if k in model.model_fields}
+
+
+class GoldenCase(_Request):
+    """One case of a server-side golden set (``components.schemas.GoldenCase``)."""
+
+    id: str = Field(pattern=r"^[A-Za-z0-9_.-]{1,64}$")
+    input: Any
+    """The run input, checked against the version's ``prompt.input_schema``."""
+    expected: Any = None
+    """Shorthand for an ``exact`` check: a string compares with the output text, any other
+    JSON with the output parsed as JSON."""
+    checks: list[dict[str, Any]] | None = None
+    """``exact``, ``contains``, ``regex``, ``json_schema`` or ``llm_judge`` checks, in the
+    format of :mod:`caliban.evals` datasets."""
+    answers: dict[str, Any] | None = None
+    """Scripted answers to human steps, by step id (``clarify#0``, ``write#0@approve``) or
+    vertex id (``clarify``, ``write@approve``)."""
+    tags: list[str] | None = None
+
+    @classmethod
+    def from_case(cls, case: Case) -> GoldenCase:
+        """Convert a local :class:`caliban.evals.Case`. It needs ``input`` (server-side
+        cases have no ``messages``); its ``node`` and ``caliban`` overrides are dropped."""
+        if case.input is None:
+            raise CalibanError(
+                f"case {case.id!r}: a server-side golden set needs 'input', not 'messages'"
+            )
+        checks = [case.check] if case.check is not None else []
+        checks += case.checks
+        return cls(
+            id=case.id,
+            input=case.input,
+            expected=case.expected,
+            checks=[c.model_dump(mode="json", by_alias=True, exclude_none=True) for c in checks]
+            or None,
+            answers=case.answers or None,
+            tags=case.tags or None,
+        )
+
+
+class GoldenSetPut(_Request):
+    """Body of ``PUT .../nodes/{name}/versions/{v}/golden-set``."""
+
+    cases: list[GoldenCase]
+
+
+class GoldenSet(_Response):
+    """A version's golden set. ``cases`` only when ``content_visible`` (``runs.data``)."""
+
+    object: str
+    node: str
+    version: int
+    hash: str
+    """``sha256:<hex>`` of the cases' canonical JSON."""
+    case_count: int
+    updated_at: datetime
+    updated_by: str
+    content_visible: bool
+    cases: list[GoldenCase] | None = None
+
+    @field_validator("cases", mode="before")
+    @classmethod
+    def _drop_unknown_case_keys(cls, v: Any) -> Any:
+        return [_known_keys(GoldenCase, c) for c in v] if isinstance(v, list) else v
+
+
+class GoldenBar(_Request):
+    min_pass_k: float = Field(ge=0, le=1)
+    """Least pass^k: the share of cases whose k runs all passed."""
+    min_k: int | None = Field(default=None, ge=1, le=10)
+    """Least ``k`` the eval must have used (server default 1)."""
+    max_cost_per_success_usd: float | None = Field(default=None, gt=0)
+    max_p95_latency_ms: int | None = Field(default=None, ge=1)
+
+
+class InjectionBar(_Request):
+    min_pass_rate: float = Field(ge=0, le=1)
+    """Least share of attacks blocked (server default 1: every attack). An injection eval is
+    required for versions with write tools whatever the bar."""
+
+
+class EvalPolicy(_Request):
+    """A node's promotion bar (``components.schemas.EvalPolicy``). ``golden=None``: no golden
+    gate; ``injection=None``: the default bar (every attack blocked) for versions with write
+    tools."""
+
+    golden: GoldenBar | None = None
+    injection: InjectionBar | None = None
+
+
+class EvalPolicyInfo(_Response):
+    """``GET``/``PUT .../nodes/{name}/eval-policy``."""
+
+    object: str | None = None
+    node: str | None = None
+    policy: EvalPolicy = Field(default_factory=EvalPolicy)
+    injection_bar: float | None = None
+    """The injection bar in effect for versions with write tools."""
+    updated_at: datetime | None = None
+    updated_by: str | None = None
+
+    @field_validator("policy", mode="before")
+    @classmethod
+    def _drop_unknown_policy_keys(cls, v: Any) -> Any:
+        v = _known_keys(EvalPolicy, v)
+        if isinstance(v, dict):
+            v = dict(v)
+            for key, bar in (("golden", GoldenBar), ("injection", InjectionBar)):
+                if key in v:
+                    v[key] = _known_keys(bar, v[key])
+        return v
+
+
+class EvalStart(_Request):
+    """Body of ``POST .../nodes/{name}/versions/{v}/evals``."""
+
+    suite: EvalSuite
+    api_key_id: str | None = None
+    """The tenant API key the eval's runs and judge calls are made, limited and metered as.
+    Required by core today; core is moving to a control-plane-managed per-tenant eval key,
+    after which it can be left out."""
+    k: int | None = Field(default=None, ge=1, le=10)
+    concurrency: int | None = Field(default=None, ge=1, le=16)
+    cases: list[str] | None = None
+    """Golden: only these cases."""
+    judge_model: str | None = None
+    """Golden: the default judge model (recorded in the summary)."""
+    input: Any = None
+    """Injection: the run input."""
+    input_case: str | None = None
+    """Injection: take the input (and its checks) from this golden case."""
+
+
+class EvalTrial(_Response):
+    case: str | None = None
+    trial: int | None = None
+    run_id: str | None = None
+    status: EvalTrialStatus | None = None
+    cost_usd: float | None = None
+    latency_ms: int | None = None
+    tokens: int | None = None
+    verdict: dict[str, Any] | None = None
+    """Metadata: checks passed (golden); category, attacked, succeeded, defenses, utility
+    (injection)."""
+    detail: Any = None
+    """With ``runs.data`` only: the output and what the scorers said, or what the sandboxed
+    tools received."""
+    finished_at: datetime | None = None
+
+
+class Eval(_Response):
+    """A node eval (``components.schemas.Eval``). ``trials`` only from ``evals.get``."""
+
+    id: str
+    object: str
+    node: str
+    version: int
+    hash: str
+    suite: EvalSuite
+    k: int
+    concurrency: int | None = None
+    case_count: int
+    status: EvalStatus
+    created_by: str | None = None
+    api_key_id: str | None = None
+    summary: dict[str, Any] | None = None
+    """Metrics only. Golden: ``pass_hat_k``, ``pass_at_1``, ``pass_at_k``, ``cost_usd``,
+    ``cost_per_success_usd``, ``judge_cost_usd``, ``latency_ms`` (``p50``, ``p95``),
+    ``by_case``, ``golden_hash``, ``judge``, ... Injection: ``pass_rate``,
+    ``attack_success_rate``, ``attacked``, ``utility_under_attack``, ``by_category``,
+    ``not_applicable``, ..."""
+    error: str | None = None
+    cancel_requested: bool | None = None
+    cancelled_by: str | None = None
+    claims: int | None = None
+    created_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    trials: list[EvalTrial] | None = None
+    content_visible: bool | None = None
+
+    @property
+    def done(self) -> bool:
+        """The eval ended (succeeded, failed or cancelled)."""
+        return self.status in ("succeeded", "failed", "cancelled")
+
+
+class EvalList(_Response):
+    object: str | None = None
+    data: list[Eval]
+    next_cursor: str | None = None
+
+
+class GateProblem(_Response):
+    kind: str
+    """``eval_gate`` for a bar the version's evals do not meet."""
+    message: str
+    path: str | None = None
+
+
+class GateCheck(_Response):
+    """``GET .../nodes/{name}/versions/{v}/gate``: what promoting the version would say."""
+
+    node: str | None = None
+    version: int | None = None
+    has_write_tools: bool | None = None
+    allowed: bool
+    evidence: dict[str, Any] | None = None
+    """The evals that meet the bar (``golden``, ``injection``); ``None`` when no gate
+    applies."""
+    problems: list[GateProblem] = Field(default_factory=list)

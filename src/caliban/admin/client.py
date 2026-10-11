@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import Mapping, Sequence
 from types import TracebackType
 from typing import Any, Literal, TypeVar
@@ -11,6 +12,7 @@ from urllib.parse import quote
 import httpx
 from pydantic import BaseModel, TypeAdapter
 
+from .. import _base
 from .._base import (
     DEFAULT_MAX_RETRIES,
     SyncHTTP,
@@ -18,6 +20,7 @@ from .._base import (
     parse_response,
 )
 from ..errors import CalibanError
+from ..evals.dataset import Dataset
 from ..nodes import NodeSpec, validate
 from .models import (
     ApiKeyCreate,
@@ -26,7 +29,20 @@ from .models import (
     Datasource,
     DatasourceCreate,
     DatasourceKind,
+    Eval,
+    EvalList,
+    EvalPolicy,
+    EvalPolicyInfo,
+    EvalStart,
+    EvalStatus,
+    EvalSuite,
+    GateCheck,
+    GoldenBar,
+    GoldenCase,
+    GoldenSet,
+    GoldenSetPut,
     Health,
+    InjectionBar,
     IntrospectJob,
     Model,
     ModelCapabilities,
@@ -91,6 +107,10 @@ class _Resource:
     def _post(self, path: str, body: Any = None) -> httpx.Response:
         # Not idempotent: retried on 429/503 only, never 502 (the server may have acted).
         return self._admin._http.request("POST", path, json=body)
+
+    def _put(self, path: str, body: Any) -> httpx.Response:
+        # PUT replaces the resource, so it is idempotent: retried on 429/502/503.
+        return self._admin._http.request("PUT", path, json=body)
 
     def _patch(self, path: str, body: Any) -> httpx.Response:
         # Not idempotent by default (each call is audited): retried on 429/503 only.
@@ -441,6 +461,185 @@ class Nodes(_Resource):
         self._delete(f"tenants/{_p(tenant_id)}/nodes/{_p(node_id)}")
 
 
+class Evals(_Resource):
+    """Server-side node evals: golden sets, the promotion bar, eval runs and the gate.
+
+    These are the evals core counts when a version is promoted. Evals run on the workers as
+    ordinary node runs, through the full request pipeline, and are audited. For a quick check
+    of a model or a node from your machine or CI, the local harness (:mod:`caliban.evals`,
+    ``caliban-eval``) runs the same golden-set format client-side, but its results never
+    count toward the promotion bar.
+    """
+
+    @staticmethod
+    def _node(tenant_id: str, node: str) -> str:
+        return f"tenants/{_p(tenant_id)}/nodes/{_p(node)}"
+
+    def _version(self, tenant_id: str, node: str, version: int) -> str:
+        return f"{self._node(tenant_id, node)}/versions/{int(version)}"
+
+    # golden sets
+
+    def get_golden_set(self, tenant_id: str, node: str, version: int) -> GoldenSet:
+        """The golden set of a version. ``cases`` is included only for a caller with
+        ``runs.data`` (``content_visible``). Raises :class:`~caliban.NotFoundError` when the
+        version has none."""
+        return self._one(
+            GoldenSet, self._get(f"{self._version(tenant_id, node, version)}/golden-set")
+        )
+
+    def put_golden_set(
+        self,
+        tenant_id: str,
+        node: str,
+        version: int,
+        cases: Dataset | Sequence[GoldenCase | Mapping[str, Any]],
+    ) -> GoldenSet:
+        """Create or replace the golden set of a version (at most 200 cases).
+
+        ``cases`` may be a local :class:`caliban.evals.Dataset`: its cases are converted with
+        :meth:`GoldenCase.from_case` (each needs ``input``). The server checks every input
+        against the version's input schema (422, problems of kind ``golden_set``).
+        """
+        if isinstance(cases, Dataset):
+            items = [GoldenCase.from_case(c) for c in cases.cases]
+        else:
+            items = [
+                c if isinstance(c, GoldenCase) else GoldenCase.model_validate(c) for c in cases
+            ]
+        body = GoldenSetPut(cases=items).to_body()
+        path = f"{self._version(tenant_id, node, version)}/golden-set"
+        return self._one(GoldenSet, self._put(path, body))
+
+    def delete_golden_set(self, tenant_id: str, node: str, version: int) -> None:
+        self._delete(f"{self._version(tenant_id, node, version)}/golden-set")
+
+    # the promotion bar
+
+    def get_policy(self, tenant_id: str, node: str) -> EvalPolicyInfo:
+        """The node's promotion bar, and the injection bar in effect for versions with write
+        tools."""
+        return self._one(EvalPolicyInfo, self._get(f"{self._node(tenant_id, node)}/eval-policy"))
+
+    def set_policy(
+        self,
+        tenant_id: str,
+        node: str,
+        *,
+        golden: GoldenBar | Mapping[str, Any] | None = None,
+        injection: InjectionBar | Mapping[str, Any] | None = None,
+    ) -> EvalPolicyInfo:
+        """Replace the node's promotion bar (``PUT``; needs ``nodes.publish``; audited).
+
+        ``golden`` gates promotion on the version's latest golden eval; leaving it out removes
+        the golden gate. ``injection`` lowers the injection bar (default: every attack
+        blocked); an injection eval stays required for versions with write tools. Calling it
+        with neither clears the bar.
+        """
+        body = EvalPolicy.model_validate({"golden": golden, "injection": injection}).to_body()
+        resp = self._put(f"{self._node(tenant_id, node)}/eval-policy", body)
+        return self._one(EvalPolicyInfo, resp)
+
+    # evals
+
+    def start(
+        self,
+        tenant_id: str,
+        node: str,
+        version: int,
+        *,
+        suite: EvalSuite,
+        api_key_id: str | None = None,
+        k: int | None = None,
+        concurrency: int | None = None,
+        cases: Sequence[str] | None = None,
+        judge_model: str | None = None,
+        input: Any = None,
+        input_case: str | None = None,
+    ) -> Eval:
+        """Start an eval of a published version (``202``; a draft is a 409).
+
+        ``suite="golden"`` runs every case of the version's golden set (or ``cases``) ``k``
+        times (default 3); ``suite="injection"`` runs the built-in injection suite against
+        sandboxed tools (``k`` default 1) with ``input``, or the input of ``input_case`` (else
+        the golden set's first case).
+
+        ``api_key_id`` names the tenant API key the eval's runs are made, limited and metered
+        as; core requires it today. Core is moving to a control-plane-managed per-tenant eval
+        key, after which it can be left out (``None`` is not sent).
+        """
+        body = EvalStart(
+            suite=suite,
+            api_key_id=api_key_id,
+            k=k,
+            concurrency=concurrency,
+            cases=None if cases is None else [*cases],
+            judge_model=judge_model,
+            input=input,
+            input_case=input_case,
+        ).to_body()
+        return self._one(Eval, self._post(f"{self._version(tenant_id, node, version)}/evals", body))
+
+    def list(
+        self,
+        tenant_id: str,
+        *,
+        node: str | None = None,
+        version: int | None = None,
+        suite: EvalSuite | None = None,
+        status: EvalStatus | Sequence[EvalStatus] | None = None,
+        limit: int | None = None,
+        cursor: str | None = None,
+    ) -> EvalList:
+        """The tenant's evals, newest first (metrics, never content). Page with ``cursor``
+        (``next_cursor`` of the previous page)."""
+        if limit is not None and not 1 <= limit <= 200:
+            raise CalibanError("limit must be between 1 and 200")
+        params = {
+            "node": node,
+            "version": version,
+            "suite": suite,
+            "status": status if status is None or isinstance(status, str) else ",".join(status),
+            "limit": limit,
+            "cursor": cursor,
+        }
+        return self._one(EvalList, self._get(f"tenants/{_p(tenant_id)}/evals", params))
+
+    def get(self, tenant_id: str, eval_id: str) -> Eval:
+        """An eval and its trials (each trial's ``detail`` only with ``runs.data``)."""
+        return self._one(Eval, self._get(f"tenants/{_p(tenant_id)}/evals/{_p(eval_id)}"))
+
+    def cancel(self, tenant_id: str, eval_id: str) -> Eval:
+        """Cancel an eval. A pending one ends at once; a running one stops, with its runs in
+        flight, at its worker's next check (``cancel_requested``). Raises
+        :class:`~caliban.ConflictError` if it already ended otherwise."""
+        return self._one(Eval, self._post(f"tenants/{_p(tenant_id)}/evals/{_p(eval_id)}/cancel"))
+
+    def wait(
+        self,
+        tenant_id: str,
+        eval_id: str,
+        *,
+        poll_s: float = 5.0,
+        timeout_s: float | None = None,
+    ) -> Eval:
+        """Poll :meth:`get` until the eval ends. Raises :class:`~caliban.CalibanError` after
+        ``timeout_s`` (the eval keeps running; :meth:`cancel` stops it)."""
+        deadline = None if timeout_s is None else time.monotonic() + timeout_s
+        while True:
+            e = self.get(tenant_id, eval_id)
+            if e.done:
+                return e
+            if deadline is not None and time.monotonic() >= deadline:
+                raise CalibanError(f"eval {eval_id} still {e.status} after {timeout_s:g}s")
+            _base._sleep(poll_s)
+
+    def gate(self, tenant_id: str, node: str, version: int) -> GateCheck:
+        """What promoting the version would say: ``allowed``, the evals that meet the bar
+        (``evidence``) or the ``problems``."""
+        return self._one(GateCheck, self._get(f"{self._version(tenant_id, node, version)}/gate"))
+
+
 class Usage(_Resource):
     def get(self, *, tenant_id: str | None = None, limit: int = 100) -> UsageReport:
         if not 1 <= limit <= 1000:
@@ -492,6 +691,7 @@ class CalibanAdmin:
         self.datasources = Datasources(self)
         self.ontology = OntologyResource(self)
         self.nodes = Nodes(self)
+        self.evals = Evals(self)
         self.usage = Usage(self)
 
     @property

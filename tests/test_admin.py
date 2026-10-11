@@ -634,3 +634,231 @@ def test_usage_cache_enum_unchanged(admin: CalibanAdmin) -> None:
     )
     with pytest.raises(APIResponseValidationError):
         admin.usage.get()
+
+
+# ───────────────────────────── evals ─────────────────────────────
+
+NV = "/tenants/t1/nodes/triage/versions/2"
+GOLDEN_SET = {
+    "object": "node.golden_set",
+    "node": "triage",
+    "version": 2,
+    "hash": "sha256:ab",
+    "case_count": 1,
+    "updated_at": TS,
+    "updated_by": "admin",
+    "content_visible": True,
+    "cases": [
+        {
+            "id": "chest",
+            "input": {"case": "Chest pain"},
+            "answers": {"clarify": "two days"},
+            "checks": [{"type": "contains", "value": ["clinical"]}],
+            "from_a_newer_server": 1,
+        }
+    ],
+}
+EVAL = {
+    "id": "ev_1",
+    "object": "node.eval",
+    "node": "triage",
+    "version": 2,
+    "hash": "sha256:cd",
+    "suite": "golden",
+    "k": 3,
+    "concurrency": 4,
+    "case_count": 1,
+    "status": "pending",
+    "created_by": "admin",
+    "api_key_id": "k1",
+    "summary": None,
+    "error": None,
+    "cancel_requested": False,
+    "cancelled_by": None,
+    "claims": 0,
+    "created_at": TS,
+    "started_at": None,
+    "finished_at": None,
+}
+
+
+def test_golden_sets(admin: CalibanAdmin) -> None:
+    from caliban.evals import Dataset
+
+    r = router(admin)
+    r.get(f"{NV}/golden-set").respond(200, json=GOLDEN_SET)
+    meta = {k: v for k, v in GOLDEN_SET.items() if k != "cases"}
+    put = r.put(f"{NV}/golden-set").respond(200, json={**meta, "content_visible": False})
+    delete = r.delete(f"{NV}/golden-set").respond(204)
+
+    g = admin.evals.get_golden_set("t1", "triage", 2)
+    assert g.hash == "sha256:ab" and g.cases and g.cases[0].answers == {"clarify": "two days"}
+    assert g.cases[0].model_extra is None  # unknown keys from a newer server dropped
+
+    cases = [{"id": "chest", "input": {"case": "Chest pain"}, "expected": "clinical"}]
+    assert admin.evals.put_golden_set("t1", "triage", 2, cases).cases is None
+    assert json.loads(put.calls.last.request.content) == {"cases": cases}
+    with pytest.raises(ValueError, match="typo"):
+        admin.evals.put_golden_set("t1", "triage", 2, [{**cases[0], "typo": 1}])
+
+    ds = Dataset.model_validate(
+        {
+            "name": "local",
+            "defaults": {"node": "triage"},
+            "cases": [
+                {
+                    "id": "c1",
+                    "input": {"case": "x"},
+                    "expected": "y",
+                    "check": {"type": "json_schema", "schema": {"type": "object"}},
+                    "checks": [{"type": "llm_judge", "rubric": "fits", "threshold": 0.7}],
+                    "answers": {"write@approve": {"approve": True}},
+                    "tags": ["t"],
+                }
+            ],
+        }
+    )
+    admin.evals.put_golden_set("t1", "triage", 2, ds)
+    assert json.loads(put.calls.last.request.content) == {
+        "cases": [
+            {
+                "id": "c1",
+                "input": {"case": "x"},
+                "expected": "y",
+                "checks": [
+                    {"type": "json_schema", "schema": {"type": "object"}},
+                    {"type": "llm_judge", "rubric": "fits", "threshold": 0.7},
+                ],
+                "answers": {"write@approve": {"approve": True}},
+                "tags": ["t"],
+            }
+        ]
+    }
+    msgs = Dataset.model_validate(
+        {"name": "m", "cases": [{"id": "m", "messages": [{"role": "user"}], "expected": "y"}]}
+    )
+    with pytest.raises(CalibanError, match="needs 'input'"):
+        admin.evals.put_golden_set("t1", "triage", 2, msgs)
+
+    admin.evals.delete_golden_set("t1", "triage", 2)
+    assert delete.called
+
+
+def test_eval_policy(admin: CalibanAdmin) -> None:
+    view = {
+        "object": "node.eval_policy",
+        "node": "triage",
+        "policy": {"golden": {"min_pass_k": 0.9, "min_k": 3, "new_bar": 1}},
+        "injection_bar": 1.0,
+        "updated_at": TS,
+        "updated_by": "admin",
+    }
+    r = router(admin)
+    r.get("/tenants/t1/nodes/triage/eval-policy").respond(200, json=view)
+    put = r.put("/tenants/t1/nodes/triage/eval-policy").respond(200, json=view)
+
+    p = admin.evals.get_policy("t1", "triage")
+    assert p.policy.golden and p.policy.golden.min_k == 3 and p.injection_bar == 1.0
+
+    admin.evals.set_policy(
+        "t1",
+        "triage",
+        golden=m.GoldenBar(min_pass_k=0.9, min_k=3, max_cost_per_success_usd=0.02),
+        injection={"min_pass_rate": 0.95},
+    )
+    assert json.loads(put.calls.last.request.content) == {
+        "golden": {"min_pass_k": 0.9, "min_k": 3, "max_cost_per_success_usd": 0.02},
+        "injection": {"min_pass_rate": 0.95},
+    }
+    admin.evals.set_policy("t1", "triage")
+    assert json.loads(put.calls.last.request.content) == {}
+    with pytest.raises(ValueError, match="less than or equal to 1"):
+        admin.evals.set_policy("t1", "triage", golden={"min_pass_k": 1.5})
+
+
+def test_start_list_get_cancel_and_gate(admin: CalibanAdmin) -> None:
+    trial = {
+        "case": "chest",
+        "trial": 0,
+        "run_id": "run_1",
+        "status": "passed",
+        "cost_usd": 0.001,
+        "latency_ms": 900,
+        "tokens": 120,
+        "verdict": {"checks": [{"type": "contains", "passed": True}]},
+        "finished_at": TS,
+    }
+    done = {
+        **EVAL,
+        "status": "succeeded",
+        "summary": {"pass_hat_k": 1.0, "cost_per_success_usd": 0.001},
+        "trials": [trial],
+        "content_visible": False,
+    }
+    r = router(admin)
+    start = r.post(f"{NV}/evals").respond(202, json=EVAL)
+    lst = r.get("/tenants/t1/evals").respond(
+        200, json={"object": "list", "data": [EVAL], "next_cursor": "c2"}
+    )
+    r.get("/tenants/t1/evals/ev_1").mock(
+        side_effect=[httpx.Response(200, json=EVAL), httpx.Response(200, json=done)]
+    )
+    cancel = r.post("/tenants/t1/evals/ev_1/cancel").respond(
+        202, json={**EVAL, "status": "running", "cancel_requested": True}
+    )
+    gate = {
+        "node": "triage",
+        "version": 2,
+        "has_write_tools": True,
+        "allowed": False,
+        "evidence": None,
+        "problems": [{"kind": "eval_gate", "message": "no injection eval"}],
+    }
+    r.get(f"{NV}/gate").respond(200, json=gate)
+
+    e = admin.evals.start("t1", "triage", 2, suite="golden", api_key_id="k1", k=3)
+    assert e.status == "pending" and not e.done
+    assert json.loads(start.calls.last.request.content) == {
+        "suite": "golden",
+        "api_key_id": "k1",
+        "k": 3,
+    }
+    # The eval key is optional: core is moving to a control-plane-managed one.
+    admin.evals.start("t1", "triage", 2, suite="injection", input={"case": "hi"})
+    assert json.loads(start.calls.last.request.content) == {
+        "suite": "injection",
+        "input": {"case": "hi"},
+    }
+    with pytest.raises(ValueError, match="less than or equal to 10"):
+        admin.evals.start("t1", "triage", 2, suite="golden", k=11)
+
+    page = admin.evals.list(
+        "t1", node="triage", version=2, suite="golden", status=["running", "pending"], limit=10
+    )
+    assert page.next_cursor == "c2" and page.data[0].id == "ev_1"
+    params = lst.calls.last.request.url.params
+    assert dict(params) == {
+        "node": "triage",
+        "version": "2",
+        "suite": "golden",
+        "status": "running,pending",
+        "limit": "10",
+    }
+    with pytest.raises(CalibanError, match="limit"):
+        admin.evals.list("t1", limit=500)
+
+    final = admin.evals.wait("t1", "ev_1", poll_s=0.01)
+    assert final.done and final.summary == {"pass_hat_k": 1.0, "cost_per_success_usd": 0.001}
+    assert final.trials and final.trials[0].status == "passed" and final.trials[0].detail is None
+
+    c = admin.evals.cancel("t1", "ev_1")
+    assert c.cancel_requested and cancel.called
+
+    g = admin.evals.gate("t1", "triage", 2)
+    assert not g.allowed and g.has_write_tools and g.problems[0].kind == "eval_gate"
+
+
+def test_eval_wait_times_out(admin: CalibanAdmin) -> None:
+    router(admin).get("/tenants/t1/evals/ev_1").respond(200, json=EVAL)
+    with pytest.raises(CalibanError, match="still pending"):
+        admin.evals.wait("t1", "ev_1", poll_s=0.01, timeout_s=0)

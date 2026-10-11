@@ -277,6 +277,7 @@ print(admin.usage.get(tenant_id=t.id, limit=100).totals)
 | `datasources` | `list`, `create`, `delete`, `introspect` |
 | `ontology` | `get`, `review`, `approve`, `reject` |
 | `nodes` | `list`, `create` (validates `spec` locally first; `validate_spec=False` skips that), `delete` |
+| `evals` | `get_golden_set`, `put_golden_set`, `delete_golden_set`, `get_policy`, `set_policy`, `start`, `list`, `get`, `cancel`, `wait`, `gate` (see [Server-side evals](#server-side-evals-and-the-promotion-gate)) |
 | `usage` | `get` (`limit` between 1 and 1000) |
 
 The constructor takes `token`, `base_url`, `timeout` (default 30 s), `max_retries`, `default_headers` and `http_client`. GET and DELETE requests retry on 429, 502 and 503. POST and PATCH requests retry only on 429 and 503, because a 502 may mean the server already acted (see [Retries](#retries)). The response models live in `caliban.admin.models`.
@@ -504,6 +505,49 @@ from caliban.evals import load_dataset, run_eval, to_markdown
 report = run_eval(load_dataset("golden.yaml"), Caliban(), model="caliban/auto", k=3, trials=5)
 print(report.summary.pass_hat_k, to_markdown(report))
 ```
+
+### Server-side evals and the promotion gate
+
+Core runs node evals itself and uses them to gate promotion: a version with write tools, or a version of a node with a golden bar, is promoted only when its latest finished evals meet the node's promotion bar (see core `docs/evals.md`). `CalibanAdmin.evals` drives that API.
+
+| | Local (`caliban-eval`, `run_eval`) | Server-side (`admin.evals`) |
+|---|---|---|
+| Runs on | your machine or CI, as a data-plane API key | the workers, as ordinary node runs |
+| Targets | any model, or a node | a published node version |
+| Golden set | a YAML file you keep | stored per node version, sealed at rest, audited |
+| Suites | golden sets | golden sets and the injection suite (sandboxed tools) |
+| LLM judge | your `judge=` callable | built in, called through the gateway |
+| Counts for promotion | no | yes |
+
+Use the local harness while you write a node or compare models and routing policies: it is quick, needs no control-plane access, and a set can target a plain model. Use server-side evals for anything that decides a promotion: only they count toward the gate, they run the injection suite, and they are audited. The two use the same golden-set format, so a local set (with `input`, not `messages`) can be uploaded as is.
+
+```python
+from caliban import CalibanAdmin
+from caliban.evals import load_dataset
+
+admin = CalibanAdmin()
+admin.evals.put_golden_set("acme", "triage", 3, load_dataset("node-golden.yaml"))
+admin.evals.set_policy(
+    "acme",
+    "triage",
+    golden={"min_pass_k": 0.9, "min_k": 3, "max_cost_per_success_usd": 0.02},
+    injection={"min_pass_rate": 1.0},
+)
+
+# The version is published with {"promote": false}, evaluated, then promoted.
+for suite in ("golden", "injection"):
+    e = admin.evals.start("acme", "triage", 3, suite=suite, api_key_id="key_evals")
+    e = admin.evals.wait("acme", e.id, timeout_s=1800)
+    print(suite, e.status, e.summary)
+
+gate = admin.evals.gate("acme", "triage", 3)
+print(gate.allowed, gate.evidence, [p.message for p in gate.problems])
+```
+
+- `start` takes `api_key_id`, the tenant API key the eval's runs are made, limited and metered as. Core requires it today; it is moving to a control-plane-managed per-tenant eval key, after which the argument can be left out (the SDK sends it only when set).
+- `get_golden_set` returns the cases only to a caller with `runs.data` (`content_visible`); `evals.get` returns the trials, with their `detail` under the same permission.
+- `set_policy` replaces the whole bar: leaving `golden` out removes the golden gate, and an injection eval stays required for versions with write tools whatever `injection` says.
+- `list` pages with `cursor`/`next_cursor`; `status` takes one status or a list.
 
 ## Streaming
 
