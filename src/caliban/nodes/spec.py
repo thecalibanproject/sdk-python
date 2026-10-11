@@ -41,6 +41,7 @@ __all__ = [
     "json_schema",
     "lint",
     "load_node",
+    "semantic_issues",
     "validate",
 ]
 

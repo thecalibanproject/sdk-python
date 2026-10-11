@@ -3,8 +3,8 @@
 With ``n`` trials of a case and ``c`` successes:
 
 * ``pass@1  = c / n``
-* ``pass@k  = 1 - C(n-c, k) / C(n, k)``  — P(at least one of k random trials passes)
-* ``pass^k  = C(c, k) / C(n, k)``        — P(all k random trials pass), as in
+* ``pass@k  = 1 - C(n-c, k) / C(n, k)``: P(at least one of k random trials passes)
+* ``pass^k  = C(c, k) / C(n, k)``: P(all k random trials pass), as in
   tau-bench (Yao et al., 2024). It measures *reliability*, and drops fast when
   a node is flaky even if pass@1 looks fine.
 

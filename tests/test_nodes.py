@@ -305,3 +305,10 @@ def test_lint_builtin_tools_and_taint() -> None:
 def test_lint_code_vertex() -> None:
     spec = validate(_workflow([{"id": "a", "type": "llm"}, {"id": "b", "type": "code"}], []))
     assert "graph.vertices[1].type: code is not yet supported (refused at publish)" in lint(spec)
+
+
+def test_spec_all_matches_package_exports() -> None:
+    import caliban.nodes
+    import caliban.nodes.spec
+
+    assert sorted(caliban.nodes.spec.__all__) == sorted(caliban.nodes.__all__)
