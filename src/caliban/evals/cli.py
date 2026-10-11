@@ -4,7 +4,11 @@ Examples::
 
     caliban-eval validate golden.yaml
     caliban-eval run golden.yaml --model caliban/auto --k 3 --base-url http://localhost:8080/v1
-    caliban-eval run golden.yaml --node invoice-triage --k 3 --trials 5 --fail-under 0.9
+    caliban-eval run golden.yaml --node invoice-triage@v3 --k 3 --trials 5 --fail-under 0.9
+
+A ``--node`` target runs each trial as a node run (``POST /v1/nodes/{name}/runs``). To gate
+promotion, run the eval server-side instead (``CalibanAdmin.evals``): only evals the control
+plane ran count toward a node's promotion bar.
 
 Exit codes: 0 ok, 1 below ``--fail-under``, 2 usage/dataset error or every trial errored.
 """
@@ -21,7 +25,7 @@ from .._client import Caliban
 from ..errors import CalibanError
 from .dataset import load_dataset
 from .report import to_markdown, write_reports
-from .runner import Pricing, Trial, run_eval
+from .runner import DEFAULT_NODE_RUN_TIMEOUT_S, Pricing, Trial, run_eval
 
 __all__ = ["build_parser", "main"]
 
@@ -44,9 +48,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     r = sub.add_parser("run", help="run a dataset against a model or node")
     r.add_argument("dataset", type=Path)
-    r.add_argument("--model", help="model id, tenant alias or caliban/auto")
-    r.add_argument(
-        "--node", help="node name (sent as caliban.node; model defaults to caliban/auto)"
+    target = r.add_mutually_exclusive_group()
+    target.add_argument("--model", help="model id, tenant alias or caliban/auto")
+    target.add_argument(
+        "--node",
+        help="node name, or name@vN for a published version (each trial is a node run)",
     )
     r.add_argument("--k", "-k", type=int, default=3, help="k for pass^k / pass@k (default 3)")
     r.add_argument("--trials", type=int, help="trials per case (default k; must be >= k)")
@@ -55,6 +61,12 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--concurrency", type=int, default=1)
     r.add_argument("--timeout", type=float, default=120.0, help="per-request timeout, seconds")
     r.add_argument("--max-retries", type=int, default=2)
+    r.add_argument(
+        "--run-timeout",
+        type=float,
+        default=DEFAULT_NODE_RUN_TIMEOUT_S,
+        help="node targets: seconds one trial's run may take before it is cancelled",
+    )
     r.add_argument("--price-in", type=float, help="USD per 1M prompt tokens (fallback cost)")
     r.add_argument("--price-out", type=float, help="USD per 1M completion tokens")
     r.add_argument("--out-dir", type=Path, default=Path("eval-reports"))
@@ -98,6 +110,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             concurrency=args.concurrency,
             pricing=pricing,
             on_trial=progress,
+            node_run_timeout_s=args.run_timeout,
         )
     if not args.quiet:
         print(file=sys.stderr)

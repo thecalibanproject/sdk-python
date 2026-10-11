@@ -35,9 +35,11 @@ def _cell(text: str, limit: int = 160) -> str:
 def to_markdown(report: EvalReport) -> str:
     s = report.summary
     k = report.k
-    target = f"model `{report.target.model}`"
-    if report.target.node:
-        target += f", node `{report.target.node}`"
+    tg = report.target
+    if tg.node:
+        target = f"node `{tg.node}`" + (f" v{tg.version}" if tg.version else " (live version)")
+    else:
+        target = f"model `{tg.model}`"
     lines = [
         f"# Eval report: {report.dataset}",
         "",
@@ -88,7 +90,9 @@ def to_markdown(report: EvalReport) -> str:
         line = f"- `{case_id}` trial {t.index}: {_cell(why)}"
         if t.output is not None:
             line += f"; output: `{_cell(t.output, 120)}`"
-        if t.request_id:
+        if t.run_id:
+            line += f" (run {t.run_id})"
+        elif t.request_id:
             line += f" (request {t.request_id})"
         lines.append(line)
     lines.append("")

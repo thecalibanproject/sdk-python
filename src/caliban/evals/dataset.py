@@ -4,10 +4,10 @@
 
     name: invoice-triage-golden
     defaults:               # all optional
-      model: caliban/auto
-      node: invoice-triage
+      model: caliban/auto    # a model target ...
+      node: invoice-triage   # ... or a node target (name or name@vN); node wins
       system: "You are terse."
-      temperature: 0
+      temperature: 0         # model targets only, like max_tokens and caliban
       max_tokens: 256
       caliban: { pii: mask } # CalibanOptions; cache defaults to "off" for evals
     cases:
@@ -19,10 +19,20 @@
         checks:                                # all must pass
           - { type: json_schema, schema: { type: object, required: [ok] } }
           - { type: regex, pattern: "ok", flags: [IGNORECASE] }
+      - id: structured                         # node targets: input is the run input
+        input: { invoice_id: 42 }              # any JSON, as in core golden sets
+        answers: { clarify: "yes" }            # scripted answers to human steps
+        expected: "approve"
+
+For a node target, ``input`` is sent as the run input as is (``POST /v1/nodes/{name}/runs``),
+the format core's server-side golden sets use, so a set can move between the two;
+``messages`` go through the node's chat mapping. For a model target, ``input`` is the user
+message (a non-string input is sent as compact JSON).
 """
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -124,14 +134,19 @@ CheckSpec = Annotated[AnyCheck, Field(discriminator="type")]
 
 class Case(_Strict):
     id: str
-    input: str | None = None
+    input: Any = None
+    """Node targets: the run input (any JSON). Model targets: the user message."""
     messages: list[ChatMessage] | None = None
     expected: str | None = None
     check: CheckSpec | None = None
     checks: list[CheckSpec] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
+    answers: dict[str, Any] = Field(default_factory=dict)
+    """Node targets: scripted answers to human steps, by step id (``clarify#0``,
+    ``write#0@approve``) or vertex id (``clarify``, ``write@approve``). A question without an
+    answer cancels the run and fails the trial; an approval without one is denied."""
     node: str | None = None
-    """Per-case node override."""
+    """Per-case node override (``name`` or ``name@vN``)."""
     caliban: CalibanOptions | None = None
     """Per-case extension override, merged over the dataset defaults."""
 
@@ -158,11 +173,27 @@ class Case(_Strict):
         msgs: list[dict[str, Any]] = []
         if self.messages is not None:
             msgs = [m.model_dump(mode="json", exclude_none=True) for m in self.messages]
-        else:
+        elif isinstance(self.input, str):
             msgs = [{"role": "user", "content": self.input}]
+        else:
+            msgs = [{"role": "user", "content": compact_json(self.input)}]
         if system and not any(m.get("role") in ("system", "developer") for m in msgs):
             msgs.insert(0, {"role": "system", "content": system})
         return msgs
+
+    def answer_for(self, step: str) -> Any:
+        """The scripted answer for a human step, or ``None`` (core's lookup rules)."""
+        if step in self.answers:
+            return self.answers[step]
+        approve = step.endswith("@approve")
+        base = step.removesuffix("@approve")
+        vertex = re.split(r"[#/.]", base.rsplit(">", 1)[-1], maxsplit=1)[0]
+        return self.answers.get(f"{vertex}@approve" if approve else vertex)
+
+
+def compact_json(value: Any) -> str:
+    """Compact JSON text, as core renders a non-string run output for text checks."""
+    return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
 
 
 class DatasetDefaults(_Strict):

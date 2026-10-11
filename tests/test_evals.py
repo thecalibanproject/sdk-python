@@ -15,12 +15,14 @@ from caliban.evals import (
     Case,
     CheckResult,
     ContainsCheck,
+    Dataset,
     DatasetError,
     ExactCheck,
     JsonSchemaCheck,
     LLMJudgeCheck,
     Pricing,
     RegexCheck,
+    Target,
     cli,
     extract_json,
     load_dataset,
@@ -32,6 +34,7 @@ from caliban.evals import (
     to_markdown,
     validate_json_schema,
 )
+from caliban.evals.runner import parse_node_ref, resolve_target
 
 from .conftest import completion_body, error_body, make_client
 
@@ -285,23 +288,288 @@ def test_run_eval_metrics() -> None:
     json.loads(report.model_dump_json())
 
 
-def test_run_eval_trials_greater_than_k_and_node_target() -> None:
+def test_run_eval_trials_greater_than_k_with_pricing_fallback() -> None:
     server = FakeServer(SCRIPT, cost=None)
-    ds = load_dataset(GOLDEN)
     report = run_eval(
-        ds,
+        load_dataset(GOLDEN),
         make_client(server),
-        node="geo-node",
         k=2,
         trials=3,
         pricing=Pricing(in_per_mtok=1.0, out_per_mtok=2.0),
     )
-    assert report.target.node == "geo-node" and report.target.model == "caliban/auto"
-    assert all(b["caliban"]["node"] == "geo-node" for b in server.bodies)
     capital = next(c for c in report.cases if c.id == "capital")
     assert math.isclose(capital.pass_hat_k, 1 / 3)  # C(2,2)/C(3,2)
     # usage = 10 prompt + 5 completion tokens per call -> 20e-6 USD
     assert math.isclose(report.summary.cost_total_usd or 0, 9 * 20e-6)
+
+
+# ───────────────────────────── node targets ─────────────────────────────
+
+
+def run_body(
+    status: str = "succeeded",
+    output: Any = "ok",
+    *,
+    run_id: str = "run_1",
+    usd: float = 0.002,
+    exec_ms: int = 120,
+    **extra: Any,
+) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "id": run_id,
+        "object": "node.run",
+        "node": "geo-node",
+        "version": 2,
+        "hash": "sha256:abc",
+        "status": status,
+        "output": output,
+        "steps": [],
+        "budget": {"steps_used": 1, "usd": usd, "wall_clock_ms_used": exec_ms},
+        "cost_usd": usd,
+        "usage": {"prompt_tokens": 30, "completion_tokens": 7, "total_tokens": 37},
+        "created_at": "2026-10-11T00:00:00Z",
+    }
+    body.update(extra)
+    return body
+
+
+class NodeServer:
+    """Answers node runs from ``SCRIPT`` (keyed by the run input); refuses chat completions."""
+
+    def __init__(self, script: dict[str, list[str]]) -> None:
+        self.script = script
+        self.counts: dict[str, int] = defaultdict(int)
+        self.requests: list[httpx.Request] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        assert request.url.path == "/v1/nodes/geo-node/runs", request.url.path
+        body = json.loads(request.content)
+        q = body["input"] if "input" in body else body["chat"]["messages"][-1]["content"]
+        outputs = self.script[q]
+        i = self.counts[q]
+        self.counts[q] += 1
+        run = run_body(output=outputs[i % len(outputs)], run_id=f"run_{len(self.requests)}")
+        return httpx.Response(200, json=run, headers={"x-caliban-request-id": "req-n"})
+
+
+def test_node_target_runs_the_node_not_the_model() -> None:
+    """Regression: node evals used to send a chat completion with caliban.node, which core
+    parses and ignores, so they measured the plain model."""
+    server = NodeServer(SCRIPT)
+    report = run_eval(load_dataset(GOLDEN), make_client(server), node="geo-node@v2", k=3)
+
+    assert len(server.requests) == 9
+    assert all(r.url.path == "/v1/nodes/geo-node/runs" for r in server.requests)
+    first = json.loads(server.requests[0].content)
+    assert first == {"input": "What is the capital of France?", "version": 2}
+    assert "model" not in first and "caliban" not in first
+    msgs = json.loads(server.requests[-1].content)["chat"]["messages"]
+    assert msgs[0] == {"role": "system", "content": "Answer tersely."}
+    keys = {r.headers["Idempotency-Key"] for r in server.requests}
+    assert len(keys) == 9 and all(k.startswith("caliban-eval:") for k in keys)
+
+    assert report.target.model_dump() == {"model": None, "node": "geo-node", "version": 2}
+    s = report.summary
+    assert (s.trials, s.successes) == (9, 6)
+    assert math.isclose(s.cost_total_usd or 0, 9 * 0.002)
+    assert math.isclose(s.cost_per_success_usd or 0, 9 * 0.002 / 6)
+    assert s.latency_p50_ms == 120
+    t = report.cases[0].trials[0]
+    assert (t.run_id, t.run_status, t.routed_model) == ("run_1", "succeeded", "node/geo-node@v2")
+    assert (t.prompt_tokens, t.completion_tokens, t.cache) == (30, 7, None)
+    assert any("model targets only" in w for w in report.warnings)
+    assert "node `geo-node` v2" in to_markdown(report)
+
+
+def test_node_target_from_dataset_defaults_and_model_prefix(tmp_path: Path) -> None:
+    p = tmp_path / "ds.yaml"
+    p.write_text(
+        "name: n\ndefaults: {model: caliban/auto, node: geo-node}\n"
+        "cases: [{id: s, input: {city: Paris}, expected: '{\"ok\":true}'}]\n"
+    )
+    bodies: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/nodes/geo-node/runs"
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json=run_body(output={"ok": True}))
+
+    ds = load_dataset(p)
+    report = run_eval(ds, make_client(handler), k=1)  # the default node wins over the model
+    assert bodies == [{"input": {"city": "Paris"}}]  # structured input, sent as is
+    assert report.summary.successes == 1  # non-string output is checked as compact JSON
+    assert report.target.node == "geo-node" and report.target.version is None
+
+    run_eval(ds, make_client(handler), model="node/geo-node@v4", k=1)
+    assert bodies[-1] == {"input": {"city": "Paris"}, "version": 4}
+
+
+def test_node_trial_outcomes_failed_runs_cost_counts() -> None:
+    ds = Dataset.model_validate(
+        {
+            "name": "o",
+            "cases": [
+                {"id": "fail", "input": "f", "expected": "x"},
+                {"id": "budget", "input": "b", "expected": "x"},
+                {"id": "slow", "input": "s", "expected": "done"},
+            ],
+        }
+    )
+    polls: dict[str, int] = defaultdict(int)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/v1/nodes/geo-node/runs":
+            q = json.loads(request.content)["input"]
+            if q == "f":
+                return httpx.Response(200, json=run_body("failed", None, error="tool down"))
+            if q == "b":
+                body = run_body("budget_exhausted", "x", stop_reason="budget.usd", usd=0.01)
+                return httpx.Response(200, json=body)
+            return httpx.Response(202, json=run_body("running", None, run_id="run_s"))
+        assert path == "/v1/runs/run_s" and request.method == "GET"
+        polls[path] += 1
+        status = "running" if polls[path] < 3 else "succeeded"
+        return httpx.Response(200, json=run_body(status, "done", run_id="run_s"))
+
+    report = run_eval(ds, make_client(handler), node="geo-node", k=1)
+    fail, budget, slow = (c.trials[0] for c in report.cases)
+    assert not fail.passed and fail.failures == ["run failed: tool down"] and fail.error is None
+    assert not budget.passed and budget.failures == ["run budget_exhausted: budget.usd"]
+    assert budget.output == "x"  # partial output kept, checks not run
+    assert slow.passed and polls["/v1/runs/run_s"] == 3
+    s = report.summary
+    # Failures are paid for too: cost per success divides every trial's cost.
+    assert math.isclose(s.cost_total_usd or 0, 0.002 + 0.01 + 0.002)
+    assert math.isclose(s.cost_per_success_usd or 0, 0.014)
+
+
+def test_node_trial_human_steps_answers_denials_and_cancels() -> None:
+    ds = Dataset.model_validate(
+        {
+            "name": "h",
+            "cases": [
+                {
+                    "id": "answered",
+                    "input": "a",
+                    "answers": {"clarify": "two days"},
+                    "expected": "triaged",
+                },
+                {"id": "approval", "input": "w", "expected": "not sent"},
+                {"id": "unanswered", "input": "q", "expected": "x"},
+            ],
+        }
+    )
+    seen: list[tuple[str, str, Any]] = []
+    waiting = {"a": "clarify#0", "w": "send#0@approve", "q": "ask#0"}
+    final = {"a": "triaged", "w": "not sent"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else None
+        seen.append((request.method, request.url.path, body))
+        path = request.url.path
+        if path == "/v1/nodes/geo-node/runs":
+            q = body["input"]
+            return httpx.Response(
+                202,
+                json=run_body(
+                    "input_required",
+                    None,
+                    run_id=f"run_{q}",
+                    awaiting={"step": waiting[q], "question": "?"},
+                ),
+            )
+        run_id = path.split("/")[3]
+        q = run_id.removeprefix("run_")
+        if path.endswith("/input"):
+            return httpx.Response(202, json=run_body("succeeded", final[q], run_id=run_id))
+        assert path.endswith("/cancel")
+        return httpx.Response(200, json=run_body("cancelled", None, run_id=run_id))
+
+    report = run_eval(ds, make_client(handler), node="geo-node", k=1)
+    answered, approval, unanswered = (c.trials[0] for c in report.cases)
+    assert answered.passed and approval.passed
+    assert ("POST", "/v1/runs/run_a/input", {"answer": "two days", "step": "clarify#0"}) in seen
+    assert (
+        "POST",
+        "/v1/runs/run_w/input",
+        {"answer": {"approve": False}, "step": "send#0@approve"},
+    ) in seen
+    assert ("POST", "/v1/runs/run_q/cancel", None) in seen
+    assert not unanswered.passed and unanswered.run_status == "cancelled"
+    assert "no answer" in unanswered.failures[0]
+
+
+def one_case(name: str) -> Dataset:
+    return Dataset.model_validate(
+        {"name": name, "cases": [{"id": "c", "input": "x", "expected": "y"}]}
+    )
+
+
+def test_node_trial_timeout_cancels_and_errors() -> None:
+    cancelled: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/cancel"):
+            cancelled.append(request.url.path)
+            return httpx.Response(202, json=run_body("running", None, cancel_requested=True))
+        return httpx.Response(202, json=run_body("running", None))
+
+    ds = one_case("t")
+    report = run_eval(ds, make_client(handler), node="geo-node", k=1, node_run_timeout_s=0)
+    t = report.cases[0].trials[0]
+    assert cancelled == ["/v1/runs/run_1/cancel"]
+    assert not t.passed and t.error and "did not end within 0s" in t.error
+    assert report.summary.errors == 1
+
+
+def test_node_trial_request_errors_are_trial_errors() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json=error_body("input does not match", "invalid_request_error"))
+
+    ds = one_case("e")
+    report = run_eval(ds, make_client(handler), node="geo-node", k=1)
+    assert (report.cases[0].trials[0].error or "").startswith("BadRequestError")
+
+
+def test_resolve_target_rules() -> None:
+    ds = load_dataset(GOLDEN)
+    assert resolve_target(ds, None, None).model == "caliban/auto"
+    assert resolve_target(ds, None, "node/geo@v3") == Target(node="geo", version=3)
+    with pytest.raises(CalibanError, match="not both"):
+        resolve_target(ds, "m", "geo")
+    for bad in ("Geo", "geo@3", "geo@v0", "a/b"):
+        with pytest.raises(CalibanError, match="invalid node"):
+            parse_node_ref(bad)
+
+
+def test_case_answer_lookup_follows_core() -> None:
+    c = Case(
+        id="a",
+        input="x",
+        expected="y",
+        answers={"clarify": 1, "write@approve": 2, "plan#1": 3, "deep": 4},
+    )
+    assert c.answer_for("clarify#0") == 1
+    assert c.answer_for("write#0@approve") == 2
+    assert c.answer_for("plan#1") == 3  # an exact step id first
+    assert c.answer_for("parent#0>deep#2/1") == 4
+    assert c.answer_for("write#0") is None and c.answer_for("other#0") is None
+
+
+def test_model_target_sends_structured_input_as_compact_json() -> None:
+    bodies: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json=completion_body("y"))
+
+    ds = Dataset.model_validate(
+        {"name": "m", "cases": [{"id": "c", "input": {"a": "é", "b": [1]}, "expected": "y"}]}
+    )
+    run_eval(ds, make_client(handler), model="m", k=1)
+    assert bodies[0]["messages"] == [{"role": "user", "content": '{"a":"é","b":[1]}'}]
 
 
 def test_run_eval_counts_api_errors_and_warns_on_cache(tmp_path: Path) -> None:
@@ -385,3 +653,18 @@ def test_cli_all_errors_exit_2(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
     md = (tmp_path / "demo-golden.eval.md").read_text()
     assert "| Errors | 3 |" in md
     assert md.count("| pass@1 | 0.0% |") == 1
+
+
+def test_cli_node_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    server = NodeServer(SCRIPT)
+    monkeypatch.setattr(cli, "_make_client", lambda args: make_client(server))
+    argv = ["run", str(GOLDEN), "--node", "geo-node@v2", "--k", "1", "--out-dir", str(tmp_path)]
+    assert cli.main([*argv, "-q"]) == 0
+    assert server.requests and all(r.url.path.endswith("/runs") for r in server.requests)
+    data = json.loads((tmp_path / "demo-golden.eval.json").read_text())
+    assert data["target"] == {"model": None, "node": "geo-node", "version": 2}
+    with pytest.raises(SystemExit):
+        cli.main([*argv, "--model", "m"])  # --model and --node are exclusive
+    assert "not allowed with" in capsys.readouterr().err

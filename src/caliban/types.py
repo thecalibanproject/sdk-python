@@ -74,6 +74,8 @@ class CalibanOptions(BaseModel):
     cache: CacheMode | None = None
     datasources: list[str] | None = None
     node: str | None = None
+    """Reserved: core parses ``caliban.node`` but does not act on it. To run a node, use
+    ``model="node/<name>"`` (or ``"node/<name>@v<N>"``), or the run API."""
     max_cost_usd: float | None = Field(default=None, ge=0)
     reasoning: ReasoningEffort | None = None
     """How hard a reasoning model should think (``off|low|medium|high``)."""

@@ -75,7 +75,7 @@ Every data-plane request body can carry a `caliban` object. Clients that do not 
 | `pii` | `off`, `mask`, `reversible` | How PII is handled before text leaves your trust boundary. `mask` replaces entities with placeholders such as `[EMAIL]`; `reversible` pseudonymises them and restores the originals in the response. |
 | `cache` | `off`, `exact`, `semantic` | Response cache mode. `off`: no cache. `exact`: exact cache only. `semantic`: exact, then the semantic cache if the tenant has it on, whatever the temperature. Unset: exact, plus semantic up to the gateway's temperature limit if the tenant has it on (see [Tenant settings](#tenant-settings)). |
 | `datasources` | `list[str]` | Datasources (by name) the request may query through the ontology layer. |
-| `node` | `str` | Run the request through a named node (agent). |
+| `node` | `str` | Reserved: core parses it but does not act on it. To run a node, use `model="node/<name>"` (see [Nodes](#nodes)). |
 | `max_cost_usd` | `float`, `>= 0` | Cost ceiling for the request. |
 | `reasoning` | `off`, `low`, `medium`, `high` | Reasoning effort, translated for the model family (see [Reasoning models](#reasoning-models)). |
 | `zdr` | `bool` | Zero data retention. |
@@ -91,7 +91,6 @@ resp = client.chat.completions.create(
         pii="reversible",
         cache="semantic",
         datasources=["erp"],
-        node="invoice-triage",
         max_cost_usd=0.05,
         reasoning="low",
         zdr=True,
@@ -417,7 +416,7 @@ print(spec.to_yaml())
 
 Tool refs are `mcp://server/tool#sha256:<hash>`, `node://name@vN` or `builtin://datasource_query`. `budgets.usd` caps what one run may spend on model calls; `guards` sets the loop guard (`max_repeats`, default 3) and transient tool retries (`tool_retries`, default 2).
 
-`lint` warns about unknown nested keys, MCP tools not pinned with `#sha256:`, node tools not pinned with `@vN`, unknown or write-effect `builtin://` tools, `builtin://datasource_query` without `datasources.scopes`, `allow_tainted` on a read tool, `code` vertices (core refuses them at publish), and write tools without an injection defence. See [`tests/fixtures/invoice-triage.node.yaml`](tests/fixtures/invoice-triage.node.yaml) for a full example. Once created, a node is called from the data plane with `caliban={"node": "invoice-triage"}`. The node design is described in [research note 04](https://github.com/thecalibanproject/docs/blob/main/research/04-agent-orchestration.md).
+`lint` warns about unknown nested keys, MCP tools not pinned with `#sha256:`, node tools not pinned with `@vN`, unknown or write-effect `builtin://` tools, `builtin://datasource_query` without `datasources.scopes`, `allow_tainted` on a read tool, `code` vertices (core refuses them at publish), and write tools without an injection defence. See [`tests/fixtures/invoice-triage.node.yaml`](tests/fixtures/invoice-triage.node.yaml) for a full example. Once published, a node is called from the data plane with `model="node/invoice-triage"` (the live version) or `model="node/invoice-triage@v3"` on chat completions, or through the run API (`POST /v1/nodes/{name}/runs`). The `caliban.node` field does not run a node. The node design is described in [research note 04](https://github.com/thecalibanproject/docs/blob/main/research/04-agent-orchestration.md).
 
 ### Evals (golden sets, pass^k)
 
@@ -427,10 +426,10 @@ Tool refs are `mcp://server/tool#sha256:<hash>`, `node://name@vN` or `builtin://
 # golden.yaml
 name: invoice-triage-golden
 defaults:
-  model: caliban/auto          # or pass --model / --node
-  node: invoice-triage
+  model: caliban/auto          # a model target, or pass --model
+  # node: invoice-triage       # or a node target (name or name@vN), or pass --node
   system: Answer tersely.
-  temperature: 0
+  temperature: 0               # model targets only, like max_tokens and caliban
   caliban: { pii: mask }       # merged over the eval default cache: off
 cases:
   - id: total
@@ -451,9 +450,11 @@ cases:
 ```bash
 caliban-eval validate golden.yaml
 caliban-eval run golden.yaml --model caliban/auto --k 3 --base-url http://localhost:8080/v1 --api-key cal_...
-caliban-eval run golden.yaml --node invoice-triage --k 3 --trials 8 --concurrency 4 \
-    --price-in 0.15 --price-out 0.60 --fail-under 0.9 --out-dir eval-reports
+caliban-eval run node-golden.yaml --node invoice-triage@v3 --k 3 --trials 8 --concurrency 4 \
+    --fail-under 0.9 --out-dir eval-reports
 ```
+
+`--model` and `--node` are exclusive; on the command line they override the dataset defaults, and a default `node` wins over a default `model`.
 
 `run` writes `eval-reports/<name>.eval.json` and `<name>.eval.md` and prints the Markdown. It exits with `0` on success, `1` when pass^k is below `--fail-under`, and `2` on a usage or dataset error or when every trial errored.
 
@@ -467,10 +468,32 @@ For a case with `n` trials and `c` passes:
 
 Both estimators are unbiased when `n >= k`, so use `--trials` above `k` to reduce variance. Dataset-level values are the mean over cases.
 
-- **Cost per success** is total cost divided by passing trials. Cost comes from `x-caliban-cost-usd` when the gateway sends it, otherwise from usage tokens and `--price-in`/`--price-out` (USD per 1M tokens, given together).
-- **Latency p50/p95** uses linear interpolation over all trials that got a response.
+- **Cost per success** is total cost divided by passing trials, so failed trials are paid for too. Cost comes from `x-caliban-cost-usd` (models) or the run's metered `cost_usd` (nodes) when the gateway sends it, otherwise from usage tokens and `--price-in`/`--price-out` (USD per 1M tokens, given together).
+- **Latency p50/p95** uses linear interpolation over all trials that got a response. For nodes it is the run's execution time (`budget.wall_clock_ms_used`), as in core's evals.
 - Evals default to `caliban.cache: "off"` so repeated trials are independent. If a trial is still a cache hit, the report warns about it.
 - `llm_judge` is a hook, not a built-in grader. Pass `judge=callable` to `run_eval(...)` to grade with a model of your choice. Without a judge, the check is reported as an error, not a pass.
+
+#### Node targets
+
+A node target (`--node name`, `--node name@vN`, `node:` in the dataset defaults or per case, or `model: node/<name>`) starts every trial as a node run with `POST /v1/nodes/{name}/runs`, the kind of run core's server-side evals create. The run API is used rather than the `model: "node/<name>"` chat shortcut because it matches how core meters and scores an eval: a run that fails or exhausts its budget still returns its cost (the chat shortcut turns it into a `502` with no cost, which would make cost per success look better than it is), the input is sent as is, and each trial carries an `Idempotency-Key`, so a retried request never starts a second run.
+
+- `input` is the run input as is (any JSON, as in core golden sets); `messages` go through the node's chat mapping.
+- A trial passes when the run succeeds and every check passes. A run that fails, exhausts its budget or is cancelled fails the trial, and its cost counts.
+- `answers` script human steps, by step id (`clarify#0`, `write#0@approve`) or vertex id (`clarify`, `write@approve`). A question without an answer cancels the run and fails the trial; an approval without one is denied.
+- A run still going after `--run-timeout` seconds (default 600) is cancelled and counted as an error.
+- `temperature`, `max_tokens` and `caliban` do not apply: the node's spec decides. The report warns when they are set.
+
+```yaml
+# node-golden.yaml
+name: invoice-triage-golden
+defaults: { node: invoice-triage }
+cases:
+  - id: chest
+    input: { case: "Chest pain since Tuesday" }
+    answers: { clarify: "two days, nobody in danger" }
+    checks:
+      - { type: json_schema, schema: { type: object, required: [urgency] } }
+```
 
 Programmatic use:
 
