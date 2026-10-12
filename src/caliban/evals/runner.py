@@ -26,7 +26,7 @@ from .. import _base
 from .._base import parse_response
 from .._client import Caliban
 from ..errors import CalibanError
-from ..types import CalibanOptions, CompletionUsage
+from ..types import AnswerCheck, CalibanOptions, CompletionUsage
 from .checkers import Judge, run_check
 from .dataset import Case, Dataset, compact_json
 from .metrics import mean, pass_at_k, pass_hat_k, percentile
@@ -245,11 +245,6 @@ class _RunUsage(CompletionUsage):
     pii_entities: int | None = None
 
 
-class _AnswerCheck(BaseModel):
-    model_config = ConfigDict(extra="allow")
-    action: str | None = None
-
-
 class _NodeRun(BaseModel):
     """The parts of ``components.schemas.NodeRun`` a trial needs."""
 
@@ -267,7 +262,7 @@ class _NodeRun(BaseModel):
     model_cost_usd: float | None = None
     usage: _RunUsage | None = None
     input_labels: list[str] | None = None
-    answer_check: _AnswerCheck | None = None
+    answer_check: AnswerCheck | None = None
 
 
 _RUN = TypeAdapter(_NodeRun)

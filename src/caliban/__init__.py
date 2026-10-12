@@ -40,6 +40,8 @@ from .errors import (
     UpstreamError,
 )
 from .types import (
+    AnswerCheck,
+    AnswerCheckFinding,
     CalibanOptions,
     CalibanResponseMeta,
     ChatCompletion,
@@ -66,6 +68,8 @@ __all__ = [
     "APIResponseValidationError",
     "APIStatusError",
     "APITimeoutError",
+    "AnswerCheck",
+    "AnswerCheckFinding",
     "AsyncCaliban",
     "AsyncChatCompletionStream",
     "AuthenticationError",

@@ -10,7 +10,7 @@ from typing import Any
 import httpx
 import pytest
 
-from caliban import Caliban, CalibanError
+from caliban import AnswerCheck, Caliban, CalibanError
 from caliban.evals import (
     Case,
     CheckResult,
@@ -722,3 +722,19 @@ def test_node_trial_reports_model_cost_pii_and_answer_guard() -> None:
     )
     t = plain.cases[0].trials[0]
     assert (t.model_cost_usd, t.pii_entities, t.answer_check) == (None, None, None)
+
+
+def test_answer_check_is_the_shared_contract_schema() -> None:
+    # NodeRun.answer_check and ConsoleRun.answer_check are one schema: AnswerCheck.
+    check = AnswerCheck.model_validate(
+        {
+            "labels": ["retrieved"],
+            "findings": [{"rule": "instruction_echo", "label": "retrieved", "at": "/answer"}],
+            "action": "refused",
+        }
+    )
+    assert check.action == "refused" and check.findings[0].rule == "instruction_echo"
+    assert check.findings[0].at == "/answer"
+    # A newer server's rule or action still parses.
+    newer = AnswerCheck.model_validate({"findings": [{"rule": "future_rule"}], "action": "x"})
+    assert (newer.labels, newer.findings[0].rule, newer.action) == ([], "future_rule", "x")

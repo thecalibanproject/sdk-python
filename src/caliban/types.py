@@ -14,6 +14,10 @@ from typing import Annotated, Any, Literal, cast
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
 __all__ = [
+    "AnswerCheck",
+    "AnswerCheckAction",
+    "AnswerCheckFinding",
+    "AnswerCheckRule",
     "CacheMode",
     "CacheStatus",
     "CacheTier",
@@ -204,6 +208,36 @@ class IntentDecision(BaseModel):
 def _cache_tier(value: str | None) -> CacheTier | None:
     v = (value or "").strip().lower()
     return cast(CacheTier, v) if v in _CACHE_TIERS else None
+
+
+AnswerCheckRule = Literal[
+    "untrusted_link", "untrusted_contact", "untrusted_reference", "instruction_echo"
+]
+AnswerCheckAction = Literal["passed", "redacted", "refused"]
+
+
+class AnswerCheckFinding(BaseModel):
+    """One finding of the answer guard: its ``rule``, the untrusted ``label`` and where
+    (``at``, a JSON pointer into the output). Never the text."""
+
+    model_config = ConfigDict(extra="allow")
+    rule: AnswerCheckRule | str | None = None
+    label: str | None = None
+    at: str | None = None
+
+
+class AnswerCheck(BaseModel):
+    """The answer guard's record (``components.schemas.AnswerCheck``), shared by a run
+    (``NodeRun.answer_check``) and the console's run detail (``ConsoleRun.answer_check``).
+
+    Present when the final output carried untrusted labels: the output's ``labels``, the
+    ``findings`` (metadata only, never text) and the ``action`` taken."""
+
+    model_config = ConfigDict(extra="allow")
+    labels: list[str] = Field(default_factory=list)
+    findings: list[AnswerCheckFinding] = Field(default_factory=list)
+    action: AnswerCheckAction | str | None = None
+    """``passed``, ``redacted`` or ``refused``."""
 
 
 class CalibanResponseMeta(BaseModel):
