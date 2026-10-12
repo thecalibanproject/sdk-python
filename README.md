@@ -286,7 +286,7 @@ print(admin.usage.get(tenant_id=t.id, limit=100).totals)
 | `providers` | `list`, `create`, `delete`, `health`, `discover` |
 | `datasources` | `list`, `create`, `delete`, `introspect`, `introspection` |
 | `ontology` | `get`, `review`, `approve`, `reject`, `deprecate`, `review_batch`, `propose` |
-| `intents` | `list`, `set`, `delete` (the tenant's `caliban/auto` exemplars) |
+| `intents` | `list`, `put` (`set` is a deprecated alias), `delete` (the tenant's `caliban/auto` exemplars) |
 | `rag` | `models`, `collections.list`, `.create`, `.get`, `.delete`, `documents.list`, `.ingest`, `.get`, `.delete`, `.release` |
 | `nodes` | `list`, `create` (validates `spec` locally first; `validate_spec=False` skips that), `delete` |
 | `evals` | `get_golden_set`, `put_golden_set`, `delete_golden_set`, `get_policy`, `set_policy`, `start`, `list`, `get`, `cancel`, `wait`, `gate`, `get_key`, `rotate_key` (see [Server-side evals](#server-side-evals-and-the-promotion-gate)) |
@@ -357,7 +357,9 @@ print(f"{totals.auto_cache_hits or 0} auto cache hits saved ${totals.auto_saved_
 ```python
 from caliban import OntologyBreakingChangeError
 
-admin.ontology.propose(t.id, curated_elements)  # made outside Caliban: version, proposed, skipped, breaking
+admin.ontology.propose(
+    t.id, curated_elements
+)  # made outside Caliban: version, proposed, skipped, breaking
 res = admin.ontology.review_batch(t.id, {"Service": "approve", "Legacy": "deprecate"}, note="ok")
 print(res.version, res.breaking)  # one new ontology version
 try:
@@ -377,12 +379,14 @@ except OntologyBreakingChangeError as e:
 A tenant's `caliban/auto` intents (the kNN exemplars routers classify with) come from the config file and from the admin API, which overrides the file intent by intent and needs no restart: routers rebuild their index with the next snapshot.
 
 ```python
-admin.intents.set(t.id, "triage", ["my chest hurts", "I feel dizzy"])  # source "api"
+admin.intents.put(
+    t.id, "triage", ["my chest hurts", "I feel dizzy"]
+)  # TenantIntentSet, source "api"
 listed = admin.intents.list(t.id)  # each intent with source ("config" or "api") and node
 admin.intents.delete(t.id, "triage")  # the config file's exemplars apply again
 ```
 
-At most 100 intents per tenant and 200 exemplars per intent, each 1 to 2000 characters (duplicates are dropped; the SDK checks lengths before sending). Intent names are 1 to 64 characters of `[a-z0-9_.-]`, and `pinned` is reserved. An empty list removes a config-file intent for the tenant (listed in `removed`). Hand an intent to a node with the tenant's `node_routes`. Changes are audited as `tenant.intent.set` and `tenant.intent.delete`, with counts and never the texts. `set` is a `PUT`, retried like a GET.
+At most 100 intents per tenant and 200 exemplars per intent, each 1 to 2000 characters (duplicates are dropped; the SDK checks lengths before sending). Intent names are 1 to 64 characters of `[a-z0-9_.-]`, and `pinned` is reserved. An empty list removes a config-file intent for the tenant (listed in `removed`). Hand an intent to a node with the tenant's `node_routes`. Changes are audited as `tenant.intent.set` and `tenant.intent.delete`, with counts and never the texts. `put` is a `PUT`, retried like a GET; `pinned` and invalid names raise `BadRequestError`, an unknown tenant `NotFoundError`. `intents.set` is a deprecated alias of `put` (it warns with `DeprecationWarning`): the method follows the HTTP verb, as in `put_golden_set` and the TypeScript SDK's `intents.put`.
 
 #### Document collections (RAG)
 

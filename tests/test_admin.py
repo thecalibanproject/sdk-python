@@ -413,15 +413,35 @@ def test_intents(admin: CalibanAdmin) -> None:
         ("billing", "config", None),
     ]
     assert listed.removed == ["smalltalk"]
-    stored = admin.intents.set("t1", "triage", ["a", "b"])
+    stored = admin.intents.put("t1", "triage", ["a", "b"])
     assert json.loads(put.calls.last.request.content) == {"exemplars": ["a", "b"]}
-    assert (stored.tenant_id, stored.source, stored.exemplars) == ("t1", "api", ["a", "b"])
-    admin.intents.set("t1", "triage", [])
+    assert isinstance(stored, m.TenantIntentSet)
+    assert (stored.tenant_id, stored.intent, stored.source, stored.exemplars) == (
+        "t1",
+        "triage",
+        "api",
+        ["a", "b"],
+    )
+    admin.intents.put("t1", "triage", [])
     assert json.loads(put.calls.last.request.content) == {"exemplars": []}
     assert admin.intents.delete("t1", "triage") is None
     assert delete.called
     with pytest.raises(ValueError, match="exemplars"):
-        admin.intents.set("t1", "triage", [""])
+        admin.intents.put("t1", "triage", [""])
+
+
+def test_intents_set_is_a_deprecated_alias_of_put(admin: CalibanAdmin) -> None:
+    put = (
+        router(admin)
+        .put("/tenants/t1/intents/triage")
+        .respond(
+            200, json={"tenant_id": "t1", "intent": "triage", "exemplars": ["a"], "source": "api"}
+        )
+    )
+    with pytest.deprecated_call(match=r"intents\.put"):
+        stored = admin.intents.set("t1", "triage", ["a"])
+    assert put.call_count == 1
+    assert isinstance(stored, m.TenantIntentSet) and stored.exemplars == ["a"]
 
 
 def test_intent_put_retried_on_502(admin: CalibanAdmin) -> None:
@@ -432,7 +452,7 @@ def test_intent_put_retried_on_502(admin: CalibanAdmin) -> None:
             200, json={"tenant_id": "t1", "intent": "x", "exemplars": [], "source": "api"}
         ),
     ]
-    admin.intents.set("t1", "x", [])
+    admin.intents.put("t1", "x", [])
     assert put.call_count == 2
 
 

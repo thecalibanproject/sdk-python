@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import time
+import warnings
 from collections.abc import Mapping, Sequence
 from types import TracebackType
 from typing import Any, Literal, TypeVar
@@ -87,8 +88,8 @@ from .models import (
     SharedProviderCreate,
     Tenant,
     TenantCreate,
-    TenantIntent,
     TenantIntents,
+    TenantIntentSet,
     TenantUpdate,
     TrustTier,
     UsageReport,
@@ -612,17 +613,26 @@ class Intents(_Resource):
         """Every intent as routers use it, with its ``source`` and node (``routes.read``)."""
         return self._one(TenantIntents, self._get(f"tenants/{_p(tenant_id)}/intents"))
 
-    def set(self, tenant_id: str, intent: str, exemplars: Sequence[str]) -> TenantIntent:
+    def put(self, tenant_id: str, intent: str, exemplars: Sequence[str]) -> TenantIntentSet:
         """Set the tenant's exemplars of an intent (``PUT``, ``routes.write``).
 
         At most 100 intents per tenant and 200 exemplars per intent, each 1 to 2000
         characters (duplicates dropped). An empty list removes a config-file intent for the
         tenant. Intent names are 1 to 64 characters of ``[a-z0-9_.-]``; ``pinned`` is
-        reserved. Audited as ``tenant.intent.set`` with counts, never the texts.
+        reserved (:class:`~caliban.BadRequestError`), and an unknown tenant raises
+        :class:`~caliban.NotFoundError`. Audited as ``tenant.intent.set`` with counts, never
+        the texts.
         """
         body = IntentExemplars(exemplars=list(exemplars)).to_body()
         resp = self._put(f"tenants/{_p(tenant_id)}/intents/{_p(intent)}", body)
-        return self._one(TenantIntent, resp)
+        return self._one(TenantIntentSet, resp)
+
+    def set(self, tenant_id: str, intent: str, exemplars: Sequence[str]) -> TenantIntentSet:
+        """Deprecated alias of :meth:`put` (the TypeScript SDK's name, and the HTTP verb)."""
+        warnings.warn(
+            "intents.set() is deprecated; use intents.put()", DeprecationWarning, stacklevel=2
+        )
+        return self.put(tenant_id, intent, exemplars)
 
     def delete(self, tenant_id: str, intent: str) -> None:
         """Drop the tenant's own exemplars of an intent; the config file's apply again.

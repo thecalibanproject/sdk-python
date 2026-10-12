@@ -116,6 +116,7 @@ __all__ = [
     "Tenant",
     "TenantCreate",
     "TenantIntent",
+    "TenantIntentSet",
     "TenantIntents",
     "TenantStatus",
     "TenantUpdate",
@@ -612,8 +613,16 @@ class TenantIntent(_Response):
     """``config``: the config file; ``api``: set through the admin API."""
     node: str | None = None
     """The node the intent hands to (``node/<name>``), if any."""
-    tenant_id: str | None = None
-    """Set on the result of ``intents.set``."""
+
+
+class TenantIntentSet(_Response):
+    """Result of ``intents.put``: the intent as stored (``components.schemas.TenantIntentSet``)."""
+
+    tenant_id: str
+    intent: str
+    exemplars: list[str] = Field(default_factory=list)
+    """As stored: trimmed, duplicates dropped."""
+    source: Literal["api"] = "api"
 
 
 class TenantIntents(_Response):
