@@ -260,8 +260,9 @@ class CalibanResponseMeta(BaseModel):
     when the model has a price; ``None`` otherwise (streams report cost in usage events). For
     a node answer, the routed models' real cost (the run's ``model_cost_usd``)."""
     billed_usd: float | None = None
-    """``x-caliban-billed-usd``: what a non-streaming node answer is billed (the run's
-    ``cost_usd``). ``None`` otherwise."""
+    """``x-caliban-billed-usd``: what a non-streaming request is billed, the flat
+    ``caliban/auto`` price (discounted on a cache hit) or the model's cost; for a node answer,
+    the run's ``cost_usd``. ``None`` when absent."""
     route: str | None = None
     """``x-caliban-route``: ``node/<name>@v<N>`` when a node answered, ``model:<id>`` when
     ``caliban/auto`` answered with a model for a tenant that maps intents to nodes."""
@@ -277,6 +278,7 @@ class CalibanResponseMeta(BaseModel):
 
     @classmethod
     def from_headers(cls, headers: Mapping[str, str]) -> CalibanResponseMeta:
+        """Parse any response's headers, for example a raw ``/v1/messages`` response."""
         cal = {k.lower(): v for k, v in headers.items() if k.lower().startswith("x-caliban-")}
         run_id = next((v for k, v in headers.items() if k.lower() == "caliban-run-id"), None)
         return cls(

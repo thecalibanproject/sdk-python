@@ -118,7 +118,7 @@ The gateway reports what it did in `x-caliban-*` response headers. Completions, 
 | `x-caliban-intent` | `intent` | The routing decision, parsed into an `IntentDecision` (`intent`, `confidence`, `stage`, `knn_reason`). `None` when absent or malformed. |
 | `x-caliban-pii-entities` | `pii_entities` | Number of PII entities detected and protected. |
 | `x-caliban-cost-usd` | `cost_usd` | Non-streaming responses only; `None` when the model has no price. For a node answer, the routed models' real cost (the run's `model_cost_usd`). |
-| `x-caliban-billed-usd` | `billed_usd` | Non-streaming node answers: what the run is billed (its `cost_usd`). |
+| `x-caliban-billed-usd` | `billed_usd` | Non-streaming only: what the request is billed, the flat `caliban/auto` price (discounted on a cache hit) or the model's cost; for a node answer, the run's `cost_usd`. |
 | `x-caliban-route` | `route` | `node/<name>@v<N>` when a node answered, `model:<id>` when `caliban/auto` answered with a model for a tenant that maps intents to nodes. |
 | `x-caliban-route-fallback` | `route_fallback` | Why `caliban/auto` answered with a model rather than a node (`low_confidence`, `no_node_for_intent`, ...). |
 | `Caliban-Run-Id` | `run_id` | The node run that answered. |
@@ -499,7 +499,7 @@ print(spec.to_yaml())
 
 Tool refs are `mcp://server/tool#sha256:<hash>`, `node://name@vN`, `builtin://datasource_query` or `builtin://rag_search` (a document collection, scoped as `rag.<collection>:read`). `budgets.usd` caps what one run may spend on model calls; `guards` sets the loop guard (`max_repeats`, default 3) and transient tool retries (`tool_retries`, default 2).
 
-**Reasoning, constrained decoding and guardrails.** `model_policy.reasoning` (`off`, `low`, `medium`, `high`) is the default reasoning effort of the node's model calls; a model vertex's `config.reasoning` (`llm`, `router`, `verify`, `reduce` with mode `llm`; `MODEL_VERTICES`) overrides it, and the gateway maps it per model family. `config.structured_output` is `json_schema` (the default: the vertex's `output_schema`, or a router's labels, go as `response_format` so vLLM, SGLang and OpenAI constrain decoding) or `prompt` (the schema in the prompt only, for servers without guided decoding); the answer is validated either way. `guardrails.answer` (`redact`, the default, `refuse` or `off`) is the answer guard on the run's final output when it carries untrusted labels: links, contacts and references that only untrusted free text supplied, and echoes of injected instructions, are removed or fail the run. `guardrails.pii` is a floor on the PII protection of the node's model calls on every model class, sovereign models included, and of untrusted tool arguments and results; it only strengthens the tenant's mode.
+**Reasoning, constrained decoding and guardrails.** `model_policy.reasoning` (`off`, `low`, `medium`, `high`) is the default reasoning effort of the node's model calls; a model vertex's `config.reasoning` (`llm`, `router`, `verify`, `reduce` with mode `llm`; `MODEL_VERTICES`) overrides it, and the gateway maps it per model family. `config.structured_output` is `json_schema` (the default: the vertex's `output_schema`, or a router's labels, go as `response_format` so vLLM, SGLang and OpenAI constrain decoding) or `prompt` (the schema in the prompt only, for servers without guided decoding); the answer is validated either way. `guardrails.answer` (`redact`, the default, `refuse` or `off`) is the answer guard on the run's final output when it carries untrusted labels: links, contacts and references that only untrusted free text supplied, and echoes of injected instructions, are removed or fail the run. `guardrails.pii` is a floor on the PII protection of the node's model calls on every model class, sovereign models included, and of untrusted tool arguments; it only strengthens the tenant's mode (`off` < `reversible` < `mask`). How tool results enter the run depends on the resulting mode. In `reversible` mode they enter as they are: the gateway pseudonymises every model call and restores its reply, untrusted tools get surrogates in their arguments, and the answer is restored for the caller, so a phone number from a catalogue row that the answer quotes reaches the caller as the real number (pseudonymising results as they entered the run would hand the caller surrogates nothing could restore; pseudonymised data is still personal data, see [research note 05](https://github.com/thecalibanproject/docs/blob/main/research/05-anonymization-and-privacy.md)). In `mask` mode they are masked as they enter, irreversibly: the model, every later step and the caller see `[PHONE]`. In `off` mode they enter as they are.
 
 ```yaml
 model_policy: { reasoning: low }
@@ -783,8 +783,12 @@ raw = client.messages.with_raw_response.create(
     extra_body={"caliban": {"pii": "reversible"}},
 )
 print(raw.headers.get("x-caliban-routed-model"))
+meta = CalibanResponseMeta.from_headers(raw.headers)  # from caliban import CalibanResponseMeta
+print(meta.billed_usd, meta.route, meta.run_id, meta.run_status)
 message = raw.parse()
 ```
+
+`/v1/messages` sends the same `x-caliban-*` headers as chat completions, the billed cost, route, run id and run status included, and `CalibanResponseMeta.from_headers` parses them off any response.
 
 When the routed model is an Anthropic model the request is passed through natively (`cache_control` breakpoints are kept and `anthropic-beta` is forwarded); otherwise the request and response, including stream events, are translated. `thinking` maps to `caliban.reasoning`. Errors use the Anthropic error shape.
 

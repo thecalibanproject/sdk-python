@@ -193,3 +193,22 @@ def test_node_answer_meta_on_completions() -> None:
     )
     assert (resp.caliban.run_id, resp.caliban.billed_usd) == ("run_9", 0.004)
     assert resp.caliban.pii_entities == 2
+
+
+def test_meta_from_an_anthropic_messages_response() -> None:
+    # /v1/messages sends the billing, route and run headers chat does; from_headers reads them
+    # off any response (here as the Anthropic SDK's raw response would carry them).
+    headers = httpx.Headers(
+        {
+            "x-caliban-request-id": "req_m1",
+            "x-caliban-cost-usd": "0.0021",
+            "x-caliban-billed-usd": "0.01",
+            "x-caliban-route": "node/triage@v3",
+            "Caliban-Run-Id": "run_m1",
+            "x-caliban-run-status": "succeeded",
+            "content-type": "application/json",
+        }
+    )
+    meta = CalibanResponseMeta.from_headers(headers)
+    assert (meta.request_id, meta.cost_usd, meta.billed_usd) == ("req_m1", 0.0021, 0.01)
+    assert (meta.route, meta.run_id, meta.run_status) == ("node/triage@v3", "run_m1", "succeeded")

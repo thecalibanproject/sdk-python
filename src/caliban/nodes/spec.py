@@ -129,8 +129,11 @@ class Guardrails(_Open):
     instructions, are removed (``redact``, the server default) or fail the run (``refuse``)."""
     pii: Literal["off", "mask", "reversible"] | None = None
     """A floor on the PII protection of the node's model calls on every model class
-    (sovereign models included), and of untrusted tool arguments and results. Only
-    strengthens the tenant's mode."""
+    (sovereign models included), and of untrusted tool arguments. Only strengthens the
+    tenant's mode (``off`` < ``reversible`` < ``mask``). In ``reversible`` mode tool results
+    enter the run as they are (the gateway pseudonymises every model call and restores the
+    reply, so the caller gets real values); in ``mask`` mode they are masked as they enter,
+    irreversibly."""
     injection_mode: Literal["none", "plan_then_execute", "camel"] | None = None
     egress: list[str] | None = None
 
