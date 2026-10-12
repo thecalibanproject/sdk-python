@@ -20,6 +20,7 @@ Hierarchy::
             ├── PolicyViolationError      type == "policy_violation" (any status)
             ├── NotFoundError             404
             ├── ConflictError             409
+            │   └── OntologyBreakingChangeError code == "ontology_breaking_change"
             ├── UnprocessableEntityError  422
             ├── RateLimitError            429 or type == "rate_limited"
             └── InternalServerError       >= 500
@@ -30,11 +31,15 @@ Hierarchy::
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
+if TYPE_CHECKING:
+    from .admin.models import OntologyBreakingChange
+
 __all__ = [
+    "ONTOLOGY_BREAKING_CHANGE",
     "APIConnectionError",
     "APIError",
     "APIResponseValidationError",
@@ -46,6 +51,7 @@ __all__ = [
     "ConflictError",
     "InternalServerError",
     "NotFoundError",
+    "OntologyBreakingChangeError",
     "PermissionDeniedError",
     "PolicyViolationError",
     "RateLimitError",
@@ -165,6 +171,30 @@ class ConflictError(APIStatusError):
     pass
 
 
+ONTOLOGY_BREAKING_CHANGE = "ontology_breaking_change"
+"""``error.code`` of a refused ontology withdrawal (409)."""
+
+
+class OntologyBreakingChangeError(ConflictError):
+    """An ontology review or proposal was refused (``409``, ``code="ontology_breaking_change"``).
+
+    It withdraws approved elements that published node versions query. :attr:`breaking` lists
+    each element, the ``change`` (``approved -> proposed``), and the node versions as
+    ``name@vN`` (``nodes``) and structured (``versions``). Publish versions written on the new
+    ontology, or repeat the call with ``acknowledge_breaking=True``.
+    """
+
+    @property
+    def breaking(self) -> list[OntologyBreakingChange]:
+        from .admin.models import OntologyBreakingChange
+
+        err = self.body.get("error") if isinstance(self.body, dict) else None
+        items = err.get("breaking") if isinstance(err, dict) else None
+        if not isinstance(items, list):
+            return []
+        return [OntologyBreakingChange.model_validate(b) for b in items if isinstance(b, dict)]
+
+
 class UnprocessableEntityError(APIStatusError):
     pass
 
@@ -242,7 +272,11 @@ def make_status_error(response: httpx.Response, body_bytes: bytes | None = None)
             body if isinstance(body, str) and body else f"HTTP {response.status_code} {reason}"
         )
 
-    cls: type[APIStatusError] | None = _BY_TYPE.get(err_type or "")
+    cls: type[APIStatusError] | None = (
+        OntologyBreakingChangeError if code == ONTOLOGY_BREAKING_CHANGE else None
+    )
+    if cls is None:
+        cls = _BY_TYPE.get(err_type or "")
     if cls is None:
         cls = _BY_STATUS.get(response.status_code)
     if cls is None:

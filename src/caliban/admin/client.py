@@ -60,6 +60,7 @@ from .models import (
     OntologyDecision,
     OntologyDecisionItem,
     OntologyElement,
+    OntologyElementProposal,
     OntologyProposalResult,
     OntologyReview,
     OntologyReviewResult,
@@ -471,7 +472,14 @@ class Datasources(_Resource):
 
 
 class OntologyResource(_Resource):
-    def get(self, *, tenant_id: str | None = None) -> Ontology:
+    def get(self, tenant_id: str) -> Ontology:
+        """The tenant's current ontology (Caliban Semantic Model).
+
+        ``tenant_id`` is required: element ids are per tenant, and the server answers ``400``
+        without it.
+        """
+        if not tenant_id:
+            raise CalibanError("ontology.get needs a tenant_id")
         return self._one(Ontology, self._get("ontology", {"tenant_id": tenant_id}))
 
     def review(
@@ -487,7 +495,8 @@ class OntologyResource(_Resource):
         tenant).
 
         Withdrawing an approved element that a published node version's fixed query touches
-        raises :class:`~caliban.ConflictError` unless ``acknowledge_breaking=True``.
+        raises :class:`~caliban.OntologyBreakingChangeError` (a ``ConflictError`` whose
+        ``breaking`` lists them) unless ``acknowledge_breaking=True``.
         """
         body = OntologyReview(
             tenant_id=tenant_id,
@@ -537,8 +546,8 @@ class OntologyResource(_Resource):
 
         ``decisions`` maps element ids to ``approve``, ``reject`` or ``deprecate`` (or is a list
         of :class:`OntologyDecisionItem`). A breaking change raises
-        :class:`~caliban.ConflictError` unless ``acknowledge_breaking=True``; the result lists
-        the ``breaking`` changes acknowledged.
+        :class:`~caliban.OntologyBreakingChangeError` unless ``acknowledge_breaking=True``; the
+        result lists the ``breaking`` changes acknowledged.
         """
         items = (
             [OntologyDecisionItem(id=k, decision=v) for k, v in decisions.items()]
@@ -555,16 +564,20 @@ class OntologyResource(_Resource):
     def propose(
         self,
         tenant_id: str,
-        elements: Sequence[OntologyElement | Mapping[str, Any]],
+        elements: Sequence[OntologyElementProposal | OntologyElement | Mapping[str, Any]],
         *,
         acknowledge_breaking: bool | None = None,
     ) -> OntologyProposalResult:
         """Propose elements made outside Caliban (an exported model, a curated file).
 
-        They are written as ``proposed`` in one version for a human to review; unchanged
-        elements are skipped. Proposing over an approved element withdraws it until it is
-        approved again, which raises :class:`~caliban.ConflictError` when that breaks a
-        published node version unless ``acknowledge_breaking=True``. 1 to 5000 elements.
+        They are written as ``proposed`` in one version for a human to review; ``status`` may
+        be left out, and whatever it says is ignored. An element whose spec, name and
+        description match the tenant's is skipped, so posting the same model again writes no
+        version and keeps every review decision. A changed element goes back to ``proposed``:
+        over an approved element that withdraws it until it is approved again, which raises
+        :class:`~caliban.OntologyBreakingChangeError` when published node versions query it,
+        unless ``acknowledge_breaking=True``. 1 to 5000 elements; the result always lists
+        ``breaking`` (empty unless acknowledged).
         """
         if not 1 <= len(elements) <= 5000:
             raise CalibanError("propose takes 1 to 5000 elements")
@@ -577,14 +590,15 @@ class OntologyResource(_Resource):
         )
 
 
-def _proposal(element: OntologyElement | Mapping[str, Any]) -> dict[str, Any]:
-    # The server writes every proposal as `proposed`, but its element type still needs a status.
+def _proposal(
+    element: OntologyElementProposal | OntologyElement | Mapping[str, Any],
+) -> dict[str, Any]:
+    # Sent as given: the server ignores `status` and writes every proposal as `proposed`.
+    if isinstance(element, OntologyElementProposal):
+        return element.to_body()
     if isinstance(element, OntologyElement):
-        out = element.model_dump(mode="json", exclude_none=True)
-    else:
-        out = dict(element)
-    out.setdefault("status", "proposed")
-    return out
+        return element.model_dump(mode="json", exclude_none=True)
+    return dict(element)
 
 
 class Intents(_Resource):

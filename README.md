@@ -268,7 +268,7 @@ ds = admin.datasources.create(
 )
 admin.datasources.introspect(ds.id)  # starts the ontology bootstrap: job_id and job
 job = admin.datasources.introspection(ds.id)  # the newest job: status, proposed, skipped, version
-onto = admin.ontology.get(tenant_id=t.id)
+onto = admin.ontology.get(t.id)
 # Approve an element (or .reject / .deprecate / .review(decision=...)); ids are per tenant.
 admin.ontology.approve(onto.elements[0].id, tenant_id=t.id, note="looks right")
 
@@ -355,15 +355,22 @@ print(f"{totals.auto_cache_hits or 0} auto cache hits saved ${totals.auto_saved_
 `datasources.introspect(datasource_id)` starts the ontology bootstrap and returns an `IntrospectJob` (`job_id`, and the `job` as it started): the control plane connects with the datasource's credentials, checks that the principal is read only, samples every collection and writes its proposals (`status="proposed"`) in one ontology version. Elements a human already reviewed, and unchanged ones, are skipped. It is MongoDB only for now. `datasources.introspection(datasource_id)` returns the newest `IntrospectionJob` (`running`, `succeeded` or `failed`, with `objects`, `proposed`, `skipped` and the ontology `version`); the control plane that ran it answers, and a datasource without a job raises `NotFoundError`.
 
 ```python
-admin.ontology.propose(t.id, curated_elements)  # made outside Caliban: version, proposed, skipped
+from caliban import OntologyBreakingChangeError
+
+admin.ontology.propose(t.id, curated_elements)  # made outside Caliban: version, proposed, skipped, breaking
 res = admin.ontology.review_batch(t.id, {"Service": "approve", "Legacy": "deprecate"}, note="ok")
 print(res.version, res.breaking)  # one new ontology version
-admin.ontology.review("Customer", tenant_id=t.id, decision="reject")
+try:
+    admin.ontology.review("Customer", tenant_id=t.id, decision="reject")
+except OntologyBreakingChangeError as e:
+    for b in e.breaking:
+        print(b.element, b.change, b.nodes)  # Customer approved -> rejected ['triage@v3']
 ```
 
-- Element ids are per tenant (two tenants may both have `Service`), so `review`, `approve`, `reject` and `deprecate` require `tenant_id`; the server answers `400` without it.
-- Withdrawing an approved element that a published node version's fixed CQIR query touches is a breaking change: `ConflictError` naming the elements and node versions, unless you pass `acknowledge_breaking=True` (those versions then fail on that query until a version written on the new ontology is published). `review_batch` returns the `breaking` changes it acknowledged. Proposing over an approved element withdraws it the same way.
-- `propose` takes `OntologyElement`s or mappings (1 to 5000); a mapping without `status` is sent as `proposed`. Every element carries `changed_in`, the ontology version its spec or status last changed in.
+- Element ids are per tenant (two tenants may both have `Service`), so `ontology.get(tenant_id)`, `review`, `approve`, `reject` and `deprecate` require `tenant_id`; the server answers `400` without it.
+- **Proposals.** `propose` takes `OntologyElementProposal`s, `OntologyElement`s or mappings (1 to 5000). `status` may be left out, and whatever it says is ignored: every element is written as `proposed`. An element whose spec, name and description match the tenant's is skipped (`skipped`), whatever status it was sent with, so posting the same exported model again writes no version and keeps every review decision (synonyms, confidence and provenance are not compared). A changed element goes back to `proposed`. The result always has `breaking` (empty unless you acknowledged some). `BadRequestError` for an empty, too long or repeated id; `NotFoundError` for an unknown tenant.
+- **Breaking changes.** Withdrawing an approved element that a published node version's fixed CQIR query touches (a decision, or a proposal that changes it) is refused with a `409` unless you pass `acknowledge_breaking=True` (those versions then fail on that query until a version written on the new ontology is published). The SDK raises it as `OntologyBreakingChangeError`, a `ConflictError` with `code == "ontology_breaking_change"`, whose `breaking` lists each element, the `change` (`approved -> proposed`), the node versions as `name@vN` (`nodes`) and the same versions as `OntologyNodeVersion(node, version)` (`versions`). `review_batch` and `propose` return the `breaking` changes they acknowledged.
+- Stored elements (`OntologyElement`) always have a `status`, and carry `changed_in`, the ontology version their spec or status last changed in.
 
 #### Intents for `caliban/auto`
 
@@ -703,6 +710,7 @@ except APIStatusError as e:
 | `PermissionDeniedError` | 403 |
 | `PolicyViolationError` | `type=policy_violation`, at any status (PII, trust tier, budget) |
 | `NotFoundError`, `ConflictError`, `UnprocessableEntityError` | 404, 409, 422 |
+| `OntologyBreakingChangeError` | 409 with `code="ontology_breaking_change"` (a subclass of `ConflictError`): an ontology decision or proposal would withdraw approved elements that published node versions query; `breaking` lists them |
 | `RateLimitError` | 429, or `type=rate_limited` |
 | `UpstreamError` | 502, or `type=upstream_error` (a subclass of `InternalServerError`) |
 | `ServiceUnavailableError`, `InternalServerError` | 503, other 5xx |

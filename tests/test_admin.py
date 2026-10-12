@@ -8,11 +8,14 @@ import pytest
 import respx
 
 from caliban import (
+    ONTOLOGY_BREAKING_CHANGE,
     APIConnectionError,
     APIResponseValidationError,
     CalibanAdmin,
     CalibanError,
+    ConflictError,
     NotFoundError,
+    OntologyBreakingChangeError,
     UpstreamError,
 )
 from caliban.admin import models as m
@@ -262,12 +265,122 @@ def test_ontology_batch_review_and_proposals(admin: CalibanAdmin) -> None:
     out = admin.ontology.propose("t1", [el, existing])
     assert (out.version, out.proposed, out.skipped) == (10, 1, 1)
     sent = json.loads(propose.calls.last.request.content)["elements"]
-    # Mappings get status "proposed" when they have none; elements keep theirs (the server
-    # writes every proposal as proposed anyway).
-    assert sent[0] == {**el, "status": "proposed"}
+    # Sent as given: status may be left out, and the server ignores it (every proposal is
+    # written as proposed).
+    assert sent[0] == el
     assert sent[1]["status"] == "approved"
+    # An older server's result has no breaking list.
+    assert out.breaking == []
     with pytest.raises(CalibanError, match="1 to 5000"):
         admin.ontology.propose("t1", [])
+
+
+def test_ontology_get_needs_the_tenant(admin: CalibanAdmin) -> None:
+    route = (
+        router(admin)
+        .get("/ontology")
+        .respond(200, json={"tenant_id": "t1", "version": 4, "elements": []})
+    )
+    assert admin.ontology.get("t1").version == 4
+    assert route.calls.last.request.url.params["tenant_id"] == "t1"
+    with pytest.raises(TypeError):
+        admin.ontology.get()  # type: ignore[call-arg]
+    with pytest.raises(CalibanError, match="tenant_id"):
+        admin.ontology.get("")
+    assert route.call_count == 1
+
+
+def test_ontology_proposals_without_status(admin: CalibanAdmin) -> None:
+    propose = (
+        router(admin)
+        .post("/tenants/t1/ontology/proposals")
+        .respond(
+            201, json={"tenant_id": "t1", "version": 7, "proposed": 0, "skipped": 2, "breaking": []}
+        )
+    )
+    proposal = m.OntologyElementProposal(
+        id="Service", kind="entity", name="Service", provenance="human"
+    )
+    reposted = m.OntologyElementProposal(
+        id="Facility", kind="entity", name="Facility", provenance="human", status="approved"
+    )
+    out = admin.ontology.propose("t1", [proposal, reposted])
+    sent = json.loads(propose.calls.last.request.content)["elements"]
+    assert sent[0] == {"id": "Service", "kind": "entity", "name": "Service", "provenance": "human"}
+    assert sent[1]["status"] == "approved"
+    # Re-posting an unchanged model (reviewed elements included) writes nothing.
+    assert (out.version, out.proposed, out.skipped, out.breaking) == (7, 0, 2, [])
+    with pytest.raises(ValueError, match="status"):
+        m.OntologyElementProposal(
+            id="X",
+            kind="entity",
+            name="X",
+            provenance="human",
+            status="maybe",  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="extra"):
+        m.OntologyElementProposal(
+            id="X",
+            kind="entity",
+            name="X",
+            provenance="human",
+            stauts="proposed",  # type: ignore[call-arg]
+        )
+
+
+BREAKING = {
+    "element": "Service.city",
+    "change": "approved -> proposed",
+    "nodes": ["triage@v3"],
+    "versions": [{"node": "triage", "version": 3}],
+}
+BREAKING_409 = {
+    "error": {
+        "message": "proposing changes to approved elements withdraws them, and published node"
+        " versions query them",
+        "type": "conflict",
+        "code": "ontology_breaking_change",
+        "breaking": [BREAKING],
+    }
+}
+
+
+def test_ontology_breaking_change_is_a_typed_error(admin: CalibanAdmin) -> None:
+    r = router(admin)
+    r.post("/tenants/t1/ontology/proposals").respond(409, json=BREAKING_409)
+    r.post("/tenants/t1/ontology/review").respond(409, json=BREAKING_409)
+    r.post("/ontology/elements/Service.city/review").respond(409, json=BREAKING_409)
+    el = {"id": "Service.city", "kind": "attribute", "name": "city", "provenance": "human"}
+
+    with pytest.raises(OntologyBreakingChangeError) as info:
+        admin.ontology.propose("t1", [el])
+    err = info.value
+    assert isinstance(err, ConflictError)
+    assert (err.status_code, err.type, err.code) == (409, "conflict", ONTOLOGY_BREAKING_CHANGE)
+    assert len(err.breaking) == 1
+    b = err.breaking[0]
+    assert (b.element, b.change, b.nodes) == ("Service.city", "approved -> proposed", ["triage@v3"])
+    assert [(v.node, v.version) for v in b.versions] == [("triage", 3)]
+
+    # The single and the batch review refuse the same way.
+    with pytest.raises(OntologyBreakingChangeError):
+        admin.ontology.review_batch("t1", {"Service.city": "reject"})
+    with pytest.raises(OntologyBreakingChangeError):
+        admin.ontology.reject("Service.city", tenant_id="t1")
+
+
+def test_other_conflicts_stay_plain(admin: CalibanAdmin) -> None:
+    router(admin).post("/tenants/t1/ontology/review").respond(
+        409, json={"error": {"message": "busy", "type": "conflict", "code": None}}
+    )
+    with pytest.raises(ConflictError) as info:
+        admin.ontology.review_batch("t1", {"Service": "approve"})
+    assert not isinstance(info.value, OntologyBreakingChangeError)
+    # Without a list, breaking is empty rather than an error.
+    bare = OntologyBreakingChangeError(
+        "x", response=httpx.Response(409), body={"error": {"code": ONTOLOGY_BREAKING_CHANGE}}
+    )
+    assert bare.breaking == []
 
 
 def test_intents(admin: CalibanAdmin) -> None:

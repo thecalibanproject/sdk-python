@@ -79,7 +79,9 @@ __all__ = [
     "OntologyDecisionItem",
     "OntologyElement",
     "OntologyElementKind",
+    "OntologyElementProposal",
     "OntologyElementStatus",
+    "OntologyNodeVersion",
     "OntologyProposalResult",
     "OntologyProvenance",
     "OntologyReview",
@@ -492,7 +494,27 @@ class IntrospectJob(_Response):
     """The job as it started. ``None`` from older servers."""
 
 
+class OntologyElementProposal(_Request):
+    """An element for ``ontology.propose`` (``components.schemas.OntologyElementProposal``).
+
+    ``status`` may be left out: whatever it says is ignored, because the server writes every
+    proposal as ``proposed``."""
+
+    id: str = Field(min_length=1, max_length=200)
+    kind: OntologyElementKind
+    name: str
+    description: str | None = None
+    synonyms: list[str] | None = None
+    status: OntologyElementStatus | None = None
+    provenance: OntologyProvenance
+    confidence: float | None = None
+    spec: dict[str, Any] | None = None
+
+
 class OntologyElement(_Response):
+    """A stored element (``components.schemas.OntologyElement``): a proposal that always has a
+    ``status``, plus ``changed_in``."""
+
     id: str
     kind: OntologyElementKind
     name: str
@@ -536,13 +558,24 @@ class OntologyBatchReview(_Request):
     acknowledge_breaking: bool | None = None
 
 
-class OntologyBreakingChange(_Response):
-    """A withdrawn element that published node versions' fixed queries touch."""
+class OntologyNodeVersion(_Response):
+    """A published node version, structured (``OntologyBreaking.versions``)."""
 
-    element: str | None = None
-    change: str | None = None
+    node: str
+    version: int
+
+
+class OntologyBreakingChange(_Response):
+    """An approved element withdrawn while published node versions' fixed queries touch it
+    (``components.schemas.OntologyBreaking``)."""
+
+    element: str
+    change: str
+    """For example ``approved -> proposed``."""
     nodes: list[str] = Field(default_factory=list)
-    """``name@vN``."""
+    """``name@vN`` of the published node versions."""
+    versions: list[OntologyNodeVersion] = Field(default_factory=list)
+    """The same node versions, structured. Empty from older servers."""
 
 
 class OntologyReviewResult(_Response):
@@ -560,9 +593,14 @@ class OntologyProposalResult(_Response):
 
     tenant_id: str
     version: int
+    """The tenant's ontology version after the call (unchanged when nothing was written)."""
     proposed: int
     skipped: int
-    """Unchanged elements, not written again."""
+    """Elements left as they are: unchanged in spec, name and description, whatever status
+    they were sent with (so a re-posted reviewed element keeps its review decision)."""
+    breaking: list[OntologyBreakingChange] = Field(default_factory=list)
+    """Approved elements this call withdrew that published node versions query (empty unless
+    ``acknowledge_breaking``)."""
 
 
 class TenantIntent(_Response):

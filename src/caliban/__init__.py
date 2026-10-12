@@ -18,6 +18,7 @@ from ._streaming import (
 from ._version import __version__
 from .admin import CalibanAdmin
 from .errors import (
+    ONTOLOGY_BREAKING_CHANGE,
     APIConnectionError,
     APIError,
     APIResponseValidationError,
@@ -29,6 +30,7 @@ from .errors import (
     ConflictError,
     InternalServerError,
     NotFoundError,
+    OntologyBreakingChangeError,
     PermissionDeniedError,
     PolicyViolationError,
     RateLimitError,
@@ -58,6 +60,7 @@ from .types import (
 
 __all__ = [
     "DEFAULT_BASE_URL",
+    "ONTOLOGY_BREAKING_CHANGE",
     "APIConnectionError",
     "APIError",
     "APIResponseValidationError",
@@ -86,6 +89,7 @@ __all__ = [
     "ModelCapabilities",
     "ModelList",
     "NotFoundError",
+    "OntologyBreakingChangeError",
     "PermissionDeniedError",
     "PolicyViolationError",
     "RateLimitError",
