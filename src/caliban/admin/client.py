@@ -45,6 +45,8 @@ from .models import (
     GoldenSetPut,
     Health,
     InjectionBar,
+    IntentExemplars,
+    IntrospectionJob,
     IntrospectJob,
     Model,
     ModelCapabilities,
@@ -54,19 +56,36 @@ from .models import (
     Node,
     NodeCreate,
     Ontology,
+    OntologyBatchReview,
+    OntologyDecision,
+    OntologyDecisionItem,
     OntologyElement,
+    OntologyProposalResult,
     OntologyReview,
+    OntologyReviewResult,
     PiiMode,
     PiiSurrogateScope,
     ProviderHealth,
     ProviderKey,
     ProviderKeyCreate,
     ProviderKind,
+    RagCollection,
+    RagCollectionCreate,
+    RagCollectionSettings,
+    RagDocument,
+    RagDocumentIngest,
+    RagDocumentList,
+    RagDocumentStatus,
+    RagDocumentVersions,
+    RagModels,
+    RagTrust,
     SemanticCacheSetting,
     SharedProvider,
     SharedProviderCreate,
     Tenant,
     TenantCreate,
+    TenantIntent,
+    TenantIntents,
     TenantUpdate,
     TrustTier,
     UsageReport,
@@ -403,8 +422,21 @@ class Datasources(_Resource):
         self._delete(f"tenants/{_p(tenant_id)}/datasources/{_p(datasource_id)}")
 
     def introspect(self, datasource_id: str) -> IntrospectJob:
-        """Start an ontology bootstrap job; proposed elements land with status=proposed."""
+        """Start the ontology bootstrap (``202``).
+
+        The control plane connects with the datasource's credentials, checks the principal is
+        read only, samples every collection and writes proposals (``status="proposed"``) in one
+        ontology version; elements a human already reviewed, and unchanged ones, are skipped.
+        MongoDB only. Follow the job with :meth:`introspection`.
+        """
         return self._one(IntrospectJob, self._post(f"datasources/{_p(datasource_id)}/introspect"))
+
+    def introspection(self, datasource_id: str) -> IntrospectionJob:
+        """The newest introspection job of the datasource (answered by the control plane that
+        ran it). Raises :class:`~caliban.NotFoundError` when there is none."""
+        return self._one(
+            IntrospectionJob, self._get(f"datasources/{_p(datasource_id)}/introspection")
+        )
 
 
 class OntologyResource(_Resource):
@@ -415,19 +447,258 @@ class OntologyResource(_Resource):
         self,
         element_id: str,
         *,
-        decision: Literal["approve", "reject"],
+        tenant_id: str,
+        decision: OntologyDecision,
         note: str | None = None,
+        acknowledge_breaking: bool | None = None,
     ) -> OntologyElement:
-        body = OntologyReview(decision=decision, note=note).to_body()
+        """Approve, reject or deprecate one element of ``tenant_id`` (element ids are per
+        tenant).
+
+        Withdrawing an approved element that a published node version's fixed query touches
+        raises :class:`~caliban.ConflictError` unless ``acknowledge_breaking=True``.
+        """
+        body = OntologyReview(
+            tenant_id=tenant_id,
+            decision=decision,
+            note=note,
+            acknowledge_breaking=acknowledge_breaking,
+        ).to_body()
         return self._one(
             OntologyElement, self._post(f"ontology/elements/{_p(element_id)}/review", body)
         )
 
-    def approve(self, element_id: str, *, note: str | None = None) -> OntologyElement:
-        return self.review(element_id, decision="approve", note=note)
+    def approve(
+        self, element_id: str, *, tenant_id: str, note: str | None = None
+    ) -> OntologyElement:
+        return self.review(element_id, tenant_id=tenant_id, decision="approve", note=note)
 
-    def reject(self, element_id: str, *, note: str | None = None) -> OntologyElement:
-        return self.review(element_id, decision="reject", note=note)
+    def reject(
+        self, element_id: str, *, tenant_id: str, note: str | None = None
+    ) -> OntologyElement:
+        return self.review(element_id, tenant_id=tenant_id, decision="reject", note=note)
+
+    def deprecate(
+        self,
+        element_id: str,
+        *,
+        tenant_id: str,
+        note: str | None = None,
+        acknowledge_breaking: bool | None = None,
+    ) -> OntologyElement:
+        return self.review(
+            element_id,
+            tenant_id=tenant_id,
+            decision="deprecate",
+            note=note,
+            acknowledge_breaking=acknowledge_breaking,
+        )
+
+    def review_batch(
+        self,
+        tenant_id: str,
+        decisions: Mapping[str, OntologyDecision] | Sequence[OntologyDecisionItem],
+        *,
+        note: str | None = None,
+        acknowledge_breaking: bool | None = None,
+    ) -> OntologyReviewResult:
+        """Review many of the tenant's elements as one new ontology version.
+
+        ``decisions`` maps element ids to ``approve``, ``reject`` or ``deprecate`` (or is a list
+        of :class:`OntologyDecisionItem`). A breaking change raises
+        :class:`~caliban.ConflictError` unless ``acknowledge_breaking=True``; the result lists
+        the ``breaking`` changes acknowledged.
+        """
+        items = (
+            [OntologyDecisionItem(id=k, decision=v) for k, v in decisions.items()]
+            if isinstance(decisions, Mapping)
+            else list(decisions)
+        )
+        body = OntologyBatchReview(
+            decisions=items, note=note, acknowledge_breaking=acknowledge_breaking
+        ).to_body()
+        return self._one(
+            OntologyReviewResult, self._post(f"tenants/{_p(tenant_id)}/ontology/review", body)
+        )
+
+    def propose(
+        self,
+        tenant_id: str,
+        elements: Sequence[OntologyElement | Mapping[str, Any]],
+        *,
+        acknowledge_breaking: bool | None = None,
+    ) -> OntologyProposalResult:
+        """Propose elements made outside Caliban (an exported model, a curated file).
+
+        They are written as ``proposed`` in one version for a human to review; unchanged
+        elements are skipped. Proposing over an approved element withdraws it until it is
+        approved again, which raises :class:`~caliban.ConflictError` when that breaks a
+        published node version unless ``acknowledge_breaking=True``. 1 to 5000 elements.
+        """
+        if not 1 <= len(elements) <= 5000:
+            raise CalibanError("propose takes 1 to 5000 elements")
+        body: dict[str, Any] = {"elements": [_proposal(e) for e in elements]}
+        if acknowledge_breaking is not None:
+            body["acknowledge_breaking"] = acknowledge_breaking
+        return self._one(
+            OntologyProposalResult,
+            self._post(f"tenants/{_p(tenant_id)}/ontology/proposals", body),
+        )
+
+
+def _proposal(element: OntologyElement | Mapping[str, Any]) -> dict[str, Any]:
+    # The server writes every proposal as `proposed`, but its element type still needs a status.
+    if isinstance(element, OntologyElement):
+        out = element.model_dump(mode="json", exclude_none=True)
+    else:
+        out = dict(element)
+    out.setdefault("status", "proposed")
+    return out
+
+
+class Intents(_Resource):
+    """The tenant's ``caliban/auto`` intents (kNN exemplars).
+
+    Set here, they override the config file intent by intent; routers rebuild their index
+    with the next snapshot, without a restart.
+    """
+
+    def list(self, tenant_id: str) -> TenantIntents:
+        """Every intent as routers use it, with its ``source`` and node (``routes.read``)."""
+        return self._one(TenantIntents, self._get(f"tenants/{_p(tenant_id)}/intents"))
+
+    def set(self, tenant_id: str, intent: str, exemplars: Sequence[str]) -> TenantIntent:
+        """Set the tenant's exemplars of an intent (``PUT``, ``routes.write``).
+
+        At most 100 intents per tenant and 200 exemplars per intent, each 1 to 2000
+        characters (duplicates dropped). An empty list removes a config-file intent for the
+        tenant. Intent names are 1 to 64 characters of ``[a-z0-9_.-]``; ``pinned`` is
+        reserved. Audited as ``tenant.intent.set`` with counts, never the texts.
+        """
+        body = IntentExemplars(exemplars=list(exemplars)).to_body()
+        resp = self._put(f"tenants/{_p(tenant_id)}/intents/{_p(intent)}", body)
+        return self._one(TenantIntent, resp)
+
+    def delete(self, tenant_id: str, intent: str) -> None:
+        """Drop the tenant's own exemplars of an intent; the config file's apply again.
+        Raises :class:`~caliban.NotFoundError` when it has none."""
+        self._delete(f"tenants/{_p(tenant_id)}/intents/{_p(intent)}")
+
+
+class RagCollections(_Resource):
+    def _base(self, tenant_id: str) -> str:
+        return f"tenants/{_p(tenant_id)}/rag/collections"
+
+    def list(self, tenant_id: str) -> list[RagCollection]:
+        """The tenant's collections, each with ``document_counts`` per status."""
+        return self._many(RagCollection, self._get(self._base(tenant_id)))
+
+    def create(
+        self,
+        tenant_id: str,
+        *,
+        name: str,
+        embedding_model: str,
+        description: str | None = None,
+        rerank_model: str | None = None,
+        settings: RagCollectionSettings | Mapping[str, Any] | None = None,
+    ) -> RagCollection:
+        """Create a collection; ``embedding_model`` is fixed for its life."""
+        body = RagCollectionCreate.model_validate(
+            {
+                "name": name,
+                "embedding_model": embedding_model,
+                "description": description,
+                "rerank_model": rerank_model,
+                "settings": settings,
+            }
+        ).to_body()
+        return self._one(RagCollection, self._post(self._base(tenant_id), body))
+
+    def get(self, tenant_id: str, collection: str) -> RagCollection:
+        """A collection with ``used_by``: the published node versions that search it."""
+        return self._one(RagCollection, self._get(f"{self._base(tenant_id)}/{_p(collection)}"))
+
+    def delete(self, tenant_id: str, collection: str) -> None:
+        """Delete a collection and its documents. Raises :class:`~caliban.ConflictError`
+        while a published node version names it in its scopes."""
+        self._delete(f"{self._base(tenant_id)}/{_p(collection)}")
+
+
+class RagDocuments(_Resource):
+    def _base(self, tenant_id: str, collection: str) -> str:
+        return f"tenants/{_p(tenant_id)}/rag/collections/{_p(collection)}/documents"
+
+    def list(
+        self,
+        tenant_id: str,
+        collection: str,
+        *,
+        status: RagDocumentStatus | None = None,
+        cursor: str | None = None,
+        limit: int | None = None,
+    ) -> RagDocumentList:
+        """One page: each document's newest version with its ``live_version``. Never the
+        content; follow ``next_cursor``."""
+        params = {"status": status, "cursor": cursor, "limit": limit}
+        return self._one(RagDocumentList, self._get(self._base(tenant_id, collection), params))
+
+    def ingest(
+        self,
+        tenant_id: str,
+        collection: str,
+        *,
+        doc_id: str,
+        content: str,
+        title: str | None = None,
+        content_type: str | None = None,
+        source: str | None = None,
+        trust: RagTrust | None = None,
+    ) -> RagDocument:
+        """Ingest a version of ``doc_id``: ``pending`` and invisible until indexed and its
+        checks passed (an untrusted one fails at ``vet_deadline_at`` otherwise). The same
+        content again returns the newest version with ``unchanged=True``."""
+        body = RagDocumentIngest(
+            doc_id=doc_id,
+            content=content,
+            title=title,
+            content_type=content_type,
+            source=source,
+            trust=trust,
+        ).to_body()
+        return self._one(RagDocument, self._post(self._base(tenant_id, collection), body))
+
+    def get(self, tenant_id: str, collection: str, doc_id: str) -> RagDocumentVersions:
+        """Every version, newest first, with its ``findings`` and ``vet_deadline_at``."""
+        path = f"{self._base(tenant_id, collection)}/{_p(doc_id)}"
+        return self._one(RagDocumentVersions, self._get(path))
+
+    def delete(self, tenant_id: str, collection: str, doc_id: str) -> None:
+        """Delete every version; it stops being served at once."""
+        self._delete(f"{self._base(tenant_id, collection)}/{_p(doc_id)}")
+
+    def release(self, tenant_id: str, collection: str, doc_id: str, *, version: int) -> RagDocument:
+        """Release a quarantined version (``rag.approve``), acknowledging its findings. It
+        goes back to ``pending`` and is indexed again; its text stays labelled ``retrieved``
+        in node runs."""
+        path = f"{self._base(tenant_id, collection)}/{_p(doc_id)}/release"
+        return self._one(
+            RagDocument, self._post(path, {"version": version, "acknowledge_findings": True})
+        )
+
+
+class Rag(_Resource):
+    """Document collections nodes search with ``builtin://rag_search`` (scope
+    ``rag.<name>:read``). Needs a document registry on the control plane, else 503."""
+
+    def __init__(self, admin: CalibanAdmin) -> None:
+        super().__init__(admin)
+        self.collections = RagCollections(admin)
+        self.documents = RagDocuments(admin)
+
+    def models(self, tenant_id: str) -> RagModels:
+        """The embedding and rerank models the tenant can reach (``rag.read``)."""
+        return self._one(RagModels, self._get(f"tenants/{_p(tenant_id)}/rag/models"))
 
 
 class Nodes(_Resource):
@@ -708,6 +979,8 @@ class CalibanAdmin:
         self.providers = Providers(self)
         self.datasources = Datasources(self)
         self.ontology = OntologyResource(self)
+        self.intents = Intents(self)
+        self.rag = Rag(self)
         self.nodes = Nodes(self)
         self.evals = Evals(self)
         self.usage = Usage(self)

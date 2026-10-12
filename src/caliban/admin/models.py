@@ -56,7 +56,11 @@ __all__ = [
     "InjectionEvidence",
     "InjectionSummary",
     "InjectionVerdict",
+    "IntentExemplars",
+    "IntentSource",
     "IntrospectJob",
+    "IntrospectionJob",
+    "IntrospectionStatus",
     "JudgeInfo",
     "LatencyPercentiles",
     "Model",
@@ -68,11 +72,17 @@ __all__ = [
     "NodeCreate",
     "NotApplicable",
     "Ontology",
+    "OntologyBatchReview",
+    "OntologyBreakingChange",
+    "OntologyDecision",
+    "OntologyDecisionItem",
     "OntologyElement",
     "OntologyElementKind",
     "OntologyElementStatus",
+    "OntologyProposalResult",
     "OntologyProvenance",
     "OntologyReview",
+    "OntologyReviewResult",
     "PiiMode",
     "PiiSurrogateScope",
     "Problem",
@@ -81,6 +91,18 @@ __all__ = [
     "ProviderKey",
     "ProviderKeyCreate",
     "ProviderKind",
+    "RagCollection",
+    "RagCollectionCreate",
+    "RagCollectionSettings",
+    "RagDocument",
+    "RagDocumentIngest",
+    "RagDocumentList",
+    "RagDocumentStatus",
+    "RagDocumentVersions",
+    "RagFinding",
+    "RagModel",
+    "RagModels",
+    "RagTrust",
     "RouteStage",
     "RunStatus",
     "SemanticCacheSetting",
@@ -88,6 +110,8 @@ __all__ = [
     "SharedProviderCreate",
     "Tenant",
     "TenantCreate",
+    "TenantIntent",
+    "TenantIntents",
     "TenantStatus",
     "TenantUpdate",
     "TrialError",
@@ -133,6 +157,12 @@ OntologyElementKind = Literal[
 ]
 OntologyElementStatus = Literal["proposed", "approved", "rejected", "stale", "deprecated"]
 OntologyProvenance = Literal["introspect", "profile", "query_log", "llm", "human"]
+OntologyDecision = Literal["approve", "reject", "deprecate"]
+IntentSource = Literal["config", "api"]
+RagTrust = Literal["trusted", "untrusted"]
+RagDocumentStatus = Literal[
+    "pending", "indexing", "ready", "quarantined", "failed", "superseded", "deleted"
+]
 EvalSuite = Literal["golden", "injection"]
 EvalStatus = Literal["pending", "running", "succeeded", "failed", "cancelled"]
 EvalTrialStatus = Literal["running", "passed", "failed", "error"]
@@ -382,8 +412,34 @@ class DatasourceCreate(_Request):
     connection: dict[str, Any] = Field(repr=False)
 
 
+IntrospectionStatus = Literal["running", "succeeded", "failed"]
+
+
+class IntrospectionJob(_Response):
+    """An ontology bootstrap job of a datasource (``components.schemas.IntrospectionJob``)."""
+
+    id: str | None = None
+    datasource_id: str | None = None
+    tenant_id: str | None = None
+    status: IntrospectionStatus | None = None
+    objects: int | None = None
+    """Collections the snapshot found."""
+    proposed: int | None = None
+    skipped: int | None = None
+    """Proposals for elements already reviewed, or unchanged."""
+    version: int | None = None
+    """The ontology version the proposals were written in."""
+    error: str | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+
+
 class IntrospectJob(_Response):
+    """``POST /api/v1/datasources/{id}/introspect`` (``202``)."""
+
     job_id: str | None = None
+    job: IntrospectionJob | None = None
+    """The job as it started. ``None`` from older servers."""
 
 
 class OntologyElement(_Response):
@@ -396,6 +452,9 @@ class OntologyElement(_Response):
     provenance: OntologyProvenance
     confidence: float | None = None
     spec: dict[str, Any] = Field(default_factory=dict)
+    changed_in: int | None = None
+    """The ontology version its spec or status last changed in. ``None`` from older servers
+    or on elements written before it was tracked."""
 
 
 class Ontology(_Response):
@@ -405,8 +464,202 @@ class Ontology(_Response):
 
 
 class OntologyReview(_Request):
-    decision: Literal["approve", "reject"]
+    """Body of ``POST /api/v1/ontology/elements/{id}/review``: ``tenant_id`` is required
+    (element ids are per tenant)."""
+
+    tenant_id: str
+    decision: OntologyDecision
     note: str | None = None
+    acknowledge_breaking: bool | None = None
+
+
+class OntologyDecisionItem(_Request):
+    id: str
+    decision: OntologyDecision
+
+
+class OntologyBatchReview(_Request):
+    """Body of ``POST /api/v1/tenants/{t}/ontology/review``: one new ontology version."""
+
+    decisions: list[OntologyDecisionItem] = Field(min_length=1, max_length=1000)
+    note: str | None = None
+    acknowledge_breaking: bool | None = None
+
+
+class OntologyBreakingChange(_Response):
+    """A withdrawn element that published node versions' fixed queries touch."""
+
+    element: str | None = None
+    change: str | None = None
+    nodes: list[str] = Field(default_factory=list)
+    """``name@vN``."""
+
+
+class OntologyReviewResult(_Response):
+    """Result of a batch review: the new ``version``, the reviewed elements and the breaking
+    changes acknowledged."""
+
+    tenant_id: str
+    version: int
+    elements: list[OntologyElement] = Field(default_factory=list)
+    breaking: list[OntologyBreakingChange] = Field(default_factory=list)
+
+
+class OntologyProposalResult(_Response):
+    """Result of ``POST /api/v1/tenants/{t}/ontology/proposals`` (``201``)."""
+
+    tenant_id: str
+    version: int
+    proposed: int
+    skipped: int
+    """Unchanged elements, not written again."""
+
+
+class TenantIntent(_Response):
+    """One ``caliban/auto`` intent as routers use it."""
+
+    intent: str
+    exemplars: list[str] = Field(default_factory=list)
+    source: IntentSource | None = None
+    """``config``: the config file; ``api``: set through the admin API."""
+    node: str | None = None
+    """The node the intent hands to (``node/<name>``), if any."""
+    tenant_id: str | None = None
+    """Set on the result of ``intents.set``."""
+
+
+class TenantIntents(_Response):
+    """``GET /api/v1/tenants/{t}/intents``."""
+
+    tenant_id: str
+    intents: list[TenantIntent] = Field(default_factory=list)
+    removed: list[str] = Field(default_factory=list)
+    """Config-file intents an empty list removes for the tenant."""
+
+
+class IntentExemplars(_Request):
+    exemplars: list[Annotated[str, Field(min_length=1, max_length=2000)]] = Field(max_length=200)
+
+
+# ───────────────────────────── document collections (RAG) ─────────────────────────────
+
+
+class RagModel(_Response):
+    id: str
+    provider: str
+    trust_tier: TrustTier
+
+
+class RagModels(_Response):
+    """The embedding and rerank models the tenant can reach."""
+
+    embedding: list[RagModel]
+    rerank: list[RagModel]
+
+
+class RagCollectionSettings(BaseModel):
+    """Closed on the server (``additionalProperties: false``); responses keep extra keys."""
+
+    model_config = ConfigDict(extra="allow")
+
+    chunk_tokens: int | None = Field(default=None, ge=64, le=2048)
+    default_trust: RagTrust | None = None
+    nav_min_chunks: int | None = Field(default=None, ge=4)
+    vet_deadline_secs: int | None = Field(default=None, ge=60, le=604800)
+    """An untrusted document whose checks have not passed this long after ingest (or after
+    its release) fails and stays invisible."""
+
+
+class RagCollection(_Response):
+    id: str
+    tenant_id: str
+    name: str
+    """What node scopes name: ``rag.<name>:read``."""
+    description: str | None = None
+    embedding_model: str
+    rerank_model: str | None = None
+    settings: RagCollectionSettings
+    created_at: datetime
+    created_by: str
+    document_counts: dict[str, int] | None = None
+    """In the listing only: documents per status, counting each document's newest version;
+    deleted documents are not counted."""
+    used_by: list[str] | None = None
+    """From ``collections.get`` only: published versions (``name@vN``) that search it."""
+
+
+class RagCollectionCreate(_Request):
+    name: str = Field(pattern=r"^[a-z0-9][a-z0-9_]{0,63}$")
+    embedding_model: str
+    description: str | None = Field(default=None, max_length=1000)
+    rerank_model: str | None = None
+    settings: RagCollectionSettings | None = None
+
+
+class RagFinding(_Response):
+    kind: str
+    """``instruction``, ``exfiltration``, ``hidden_unicode``, ``url`` or ``near_duplicate``."""
+    chunk: int
+    """The chunk (0-based) it was found in."""
+    heading_path: list[str] | None = None
+    """The headings above that chunk (pseudonymised, never an excerpt of what triggered the
+    finding). ``None`` from older servers."""
+
+
+class RagDocument(_Response):
+    """One version of a document (``components.schemas.RagDocument``). Never the content."""
+
+    tenant_id: str
+    collection_id: str
+    doc_id: str
+    version: int
+    content_type: str
+    source: str | None = None
+    trust: RagTrust
+    bytes: int
+    valid_from: datetime | None = None
+    valid_to: datetime | None = None
+    status: RagDocumentStatus
+    chunks: int
+    tokens: int
+    pii_entities: int
+    findings: list[RagFinding] = Field(default_factory=list)
+    findings_acknowledged: bool
+    error: str | None = None
+    attempts: int
+    created_at: datetime
+    created_by: str
+    indexed_at: datetime | None = None
+    released_by: str | None = None
+    released_at: datetime | None = None
+    vet_deadline_at: datetime | None = None
+    """Untrusted documents only: when its checks must have passed, or it fails."""
+    live_version: int | None = None
+    """In the document listing: the version being served (``None``: none is ready)."""
+    unchanged: bool | None = None
+    """On ingest: ``True`` when the same content was already there."""
+
+
+class RagDocumentIngest(_Request):
+    doc_id: str = Field(min_length=1, max_length=200)
+    content: str = Field(repr=False)
+    title: str | None = Field(default=None, max_length=500)
+    content_type: str | None = None
+    source: str | None = Field(default=None, max_length=2000)
+    trust: RagTrust | None = None
+    valid_from: datetime | None = None
+    valid_to: datetime | None = None
+
+
+class RagDocumentList(_Response):
+    documents: list[RagDocument]
+    next_cursor: str | None = None
+
+
+class RagDocumentVersions(_Response):
+    doc_id: str
+    live_version: int | None = None
+    versions: list[RagDocument]
 
 
 class Node(_Response):

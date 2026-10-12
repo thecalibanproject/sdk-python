@@ -258,10 +258,11 @@ ds = admin.datasources.create(
     name="sales",
     connection={"uri": "mongodb://mongo:27017", "database": "sales"},
 )
-admin.datasources.introspect(ds.id)  # starts an introspection job
+admin.datasources.introspect(ds.id)  # starts the ontology bootstrap: job_id and job
+job = admin.datasources.introspection(ds.id)  # the newest job: status, proposed, skipped, version
 onto = admin.ontology.get(tenant_id=t.id)
-# Approve an element (or .reject / .review(decision=...)).
-admin.ontology.approve(onto.elements[0].id, note="looks right")
+# Approve an element (or .reject / .deprecate / .review(decision=...)); ids are per tenant.
+admin.ontology.approve(onto.elements[0].id, tenant_id=t.id, note="looks right")
 
 admin.nodes.create(tenant_id=t.id, name="invoice-triage", spec=load_node("triage.yaml"))
 admin.nodes.list(tenant_id=t.id)
@@ -275,8 +276,10 @@ print(admin.usage.get(tenant_id=t.id, limit=100).totals)
 | `provider_keys` | `list`, `create`, `delete` |
 | `models` | `list`, `create`, `delete` |
 | `providers` | `list`, `create`, `delete`, `health`, `discover` |
-| `datasources` | `list`, `create`, `delete`, `introspect` |
-| `ontology` | `get`, `review`, `approve`, `reject` |
+| `datasources` | `list`, `create`, `delete`, `introspect`, `introspection` |
+| `ontology` | `get`, `review`, `approve`, `reject`, `deprecate`, `review_batch`, `propose` |
+| `intents` | `list`, `set`, `delete` (the tenant's `caliban/auto` exemplars) |
+| `rag` | `models`, `collections.list`, `.create`, `.get`, `.delete`, `documents.list`, `.ingest`, `.get`, `.delete`, `.release` |
 | `nodes` | `list`, `create` (validates `spec` locally first; `validate_spec=False` skips that), `delete` |
 | `evals` | `get_golden_set`, `put_golden_set`, `delete_golden_set`, `get_policy`, `set_policy`, `start`, `list`, `get`, `cancel`, `wait`, `gate`, `get_key`, `rotate_key` (see [Server-side evals](#server-side-evals-and-the-promotion-gate)) |
 | `usage` | `get` (`limit` between 1 and 1000) |
@@ -331,6 +334,56 @@ print(f"{totals.semantic_cache_hits or 0} of {totals.cache_hits or 0} hits were 
 print(f"auto margin: ${totals.margin_usd or 0:.4f} over {totals.auto_requests or 0} requests")
 print(f"{totals.auto_cache_hits or 0} auto cache hits saved ${totals.auto_saved_usd or 0:.4f}")
 ```
+
+#### Ontology bootstrap and review
+
+`datasources.introspect(datasource_id)` starts the ontology bootstrap and returns an `IntrospectJob` (`job_id`, and the `job` as it started): the control plane connects with the datasource's credentials, checks that the principal is read only, samples every collection and writes its proposals (`status="proposed"`) in one ontology version. Elements a human already reviewed, and unchanged ones, are skipped. It is MongoDB only for now. `datasources.introspection(datasource_id)` returns the newest `IntrospectionJob` (`running`, `succeeded` or `failed`, with `objects`, `proposed`, `skipped` and the ontology `version`); the control plane that ran it answers, and a datasource without a job raises `NotFoundError`.
+
+```python
+admin.ontology.propose(t.id, curated_elements)  # made outside Caliban: version, proposed, skipped
+res = admin.ontology.review_batch(t.id, {"Service": "approve", "Legacy": "deprecate"}, note="ok")
+print(res.version, res.breaking)  # one new ontology version
+admin.ontology.review("Customer", tenant_id=t.id, decision="reject")
+```
+
+- Element ids are per tenant (two tenants may both have `Service`), so `review`, `approve`, `reject` and `deprecate` require `tenant_id`; the server answers `400` without it.
+- Withdrawing an approved element that a published node version's fixed CQIR query touches is a breaking change: `ConflictError` naming the elements and node versions, unless you pass `acknowledge_breaking=True` (those versions then fail on that query until a version written on the new ontology is published). `review_batch` returns the `breaking` changes it acknowledged. Proposing over an approved element withdraws it the same way.
+- `propose` takes `OntologyElement`s or mappings (1 to 5000); a mapping without `status` is sent as `proposed`. Every element carries `changed_in`, the ontology version its spec or status last changed in.
+
+#### Intents for `caliban/auto`
+
+A tenant's `caliban/auto` intents (the kNN exemplars routers classify with) come from the config file and from the admin API, which overrides the file intent by intent and needs no restart: routers rebuild their index with the next snapshot.
+
+```python
+admin.intents.set(t.id, "triage", ["my chest hurts", "I feel dizzy"])  # source "api"
+listed = admin.intents.list(t.id)  # each intent with source ("config" or "api") and node
+admin.intents.delete(t.id, "triage")  # the config file's exemplars apply again
+```
+
+At most 100 intents per tenant and 200 exemplars per intent, each 1 to 2000 characters (duplicates are dropped; the SDK checks lengths before sending). Intent names are 1 to 64 characters of `[a-z0-9_.-]`, and `pinned` is reserved. An empty list removes a config-file intent for the tenant (listed in `removed`). Hand an intent to a node with the tenant's `node_routes`. Changes are audited as `tenant.intent.set` and `tenant.intent.delete`, with counts and never the texts. `set` is a `PUT`, retried like a GET.
+
+#### Document collections (RAG)
+
+Nodes search a collection with the `builtin://rag_search` tool, naming it in their scopes as `rag.<name>:read`. The control plane needs a document registry for these calls (else `ServiceUnavailableError`).
+
+```python
+models = admin.rag.models(t.id)  # embedding and rerank models the tenant can reach
+admin.rag.collections.create(t.id, name="policies", embedding_model=models.embedding[0].id)
+admin.rag.documents.ingest(t.id, "policies", doc_id="leave", content=markdown, trust="untrusted")
+
+for c in admin.rag.collections.list(t.id):
+    print(c.name, c.document_counts)  # {"ready": 12, "quarantined": 1}
+v = admin.rag.documents.get(t.id, "policies", "leave").versions[0]
+if v.status == "quarantined":
+    print([(f.kind, f.heading_path) for f in v.findings])
+    admin.rag.documents.release(t.id, "policies", "leave", version=v.version)
+```
+
+- `rag.models` lists the catalogue models of kind `embedding` and `rerank` that one of the tenant's providers, or a shared provider that serves it, can reach, each with its `trust_tier`.
+- `document_counts` (on the collection listing only) counts documents per status, using each document's newest version; deleted documents are not counted. `collections.get` adds `used_by`, the published node versions that search the collection.
+- A version is `pending` and invisible until a worker has indexed it and its checks passed. An untrusted version whose checks have not passed by `vet_deadline_at` (the collection's `vet_deadline_secs` after ingest, or after its release) fails and stays invisible.
+- A finding's `heading_path` gives the headings above the chunk it was found in, so a reviewer can find the place in the source. It is pseudonymised like the indexed text and is never an excerpt of what triggered the finding.
+- `release` acknowledges the version's findings (that is the decision it records). Released text is still labelled `retrieved` in node runs: a tainted write it inspires needs an allowlist entry or a human approval.
 
 **Deleting and revoking.** `tenants.delete(tenant_id)`, `api_keys.revoke(tenant_id, key_id)`, `datasources.delete(tenant_id, datasource_id)` and `nodes.delete(tenant_id, node_id)` return `None` on success (204). An unknown id, an id that belongs to another tenant, or one that is already deleted raises `NotFoundError`, so a repeated delete raises too.
 

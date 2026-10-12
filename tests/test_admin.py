@@ -163,10 +163,275 @@ def test_ontology(admin: CalibanAdmin) -> None:
 
     onto = admin.ontology.get(tenant_id="t1")
     assert onto.version == 4 and onto.elements[0].synonyms == []
-    assert admin.ontology.approve("e1", note="lgtm").status == "approved"
-    assert json.loads(review.calls.last.request.content) == {"decision": "approve", "note": "lgtm"}
-    admin.ontology.review("e1", decision="reject")
-    assert json.loads(review.calls.last.request.content) == {"decision": "reject"}
+    assert admin.ontology.approve("e1", tenant_id="t1", note="lgtm").status == "approved"
+    assert json.loads(review.calls.last.request.content) == {
+        "tenant_id": "t1",
+        "decision": "approve",
+        "note": "lgtm",
+    }
+    admin.ontology.review("e1", tenant_id="t1", decision="reject")
+    assert json.loads(review.calls.last.request.content) == {
+        "tenant_id": "t1",
+        "decision": "reject",
+    }
+    admin.ontology.deprecate("e1", tenant_id="t1", acknowledge_breaking=True)
+    assert json.loads(review.calls.last.request.content) == {
+        "tenant_id": "t1",
+        "decision": "deprecate",
+        "acknowledge_breaking": True,
+    }
+
+
+def test_ontology_review_needs_the_tenant(admin: CalibanAdmin) -> None:
+    with pytest.raises(TypeError):
+        admin.ontology.review("e1", decision="approve")  # type: ignore[call-arg]
+    with pytest.raises(ValueError, match="decision"):
+        m.OntologyReview(tenant_id="t1", decision="maybe")  # type: ignore[arg-type]
+
+
+INTROSPECTION = {
+    "id": "ij1",
+    "datasource_id": "d1",
+    "tenant_id": "t1",
+    "status": "succeeded",
+    "objects": 4,
+    "proposed": 9,
+    "skipped": 2,
+    "version": 7,
+    "started_at": TS,
+    "finished_at": TS,
+}
+
+
+def test_introspection_job(admin: CalibanAdmin) -> None:
+    r = router(admin)
+    running = {**INTROSPECTION, "status": "running", "version": None}
+    r.post("/datasources/d1/introspect").respond(202, json={"job_id": "ij1", "job": running})
+    r.get("/datasources/d%2F1/introspection").respond(200, json=INTROSPECTION)
+    r.get("/datasources/none/introspection").respond(
+        404, json={"error": {"message": "introspection job not found", "type": "not_found"}}
+    )
+
+    started = admin.datasources.introspect("d1")
+    assert started.job is not None and started.job.status == "running"
+    assert started.job.version is None
+    job = admin.datasources.introspection("d/1")
+    assert (job.status, job.proposed, job.skipped, job.version) == ("succeeded", 9, 2, 7)
+    with pytest.raises(NotFoundError):
+        admin.datasources.introspection("none")
+
+
+def test_ontology_batch_review_and_proposals(admin: CalibanAdmin) -> None:
+    el = {"id": "Service", "kind": "entity", "name": "Service", "provenance": "human", "spec": {}}
+    r = router(admin)
+    batch = r.post("/tenants/t1/ontology/review").respond(
+        200,
+        json={
+            "tenant_id": "t1",
+            "version": 9,
+            "elements": [{**el, "status": "deprecated", "changed_in": 9}],
+            "breaking": [
+                {"element": "Service", "change": "deprecated", "nodes": ["triage@v3"]},
+            ],
+        },
+    )
+    propose = r.post("/tenants/t1/ontology/proposals").respond(
+        201, json={"tenant_id": "t1", "version": 10, "proposed": 1, "skipped": 1}
+    )
+
+    res = admin.ontology.review_batch(
+        "t1", {"Service": "deprecate"}, note="retired", acknowledge_breaking=True
+    )
+    assert json.loads(batch.calls.last.request.content) == {
+        "decisions": [{"id": "Service", "decision": "deprecate"}],
+        "note": "retired",
+        "acknowledge_breaking": True,
+    }
+    assert res.version == 9 and res.elements[0].changed_in == 9
+    assert res.breaking[0].nodes == ["triage@v3"]
+
+    items = [m.OntologyDecisionItem(id="Service", decision="approve")]
+    admin.ontology.review_batch("t1", items)
+    assert json.loads(batch.calls.last.request.content) == {
+        "decisions": [{"id": "Service", "decision": "approve"}]
+    }
+    with pytest.raises(ValueError, match="decisions"):
+        admin.ontology.review_batch("t1", {})
+
+    existing = m.OntologyElement.model_validate({**el, "status": "approved"})
+    out = admin.ontology.propose("t1", [el, existing])
+    assert (out.version, out.proposed, out.skipped) == (10, 1, 1)
+    sent = json.loads(propose.calls.last.request.content)["elements"]
+    # Mappings get status "proposed" when they have none; elements keep theirs (the server
+    # writes every proposal as proposed anyway).
+    assert sent[0] == {**el, "status": "proposed"}
+    assert sent[1]["status"] == "approved"
+    with pytest.raises(CalibanError, match="1 to 5000"):
+        admin.ontology.propose("t1", [])
+
+
+def test_intents(admin: CalibanAdmin) -> None:
+    r = router(admin)
+    r.get("/tenants/t1/intents").respond(
+        200,
+        json={
+            "tenant_id": "t1",
+            "intents": [
+                {
+                    "intent": "triage",
+                    "exemplars": ["my chest hurts"],
+                    "source": "api",
+                    "node": "node/triage",
+                },
+                {"intent": "billing", "exemplars": ["refund"], "source": "config", "node": None},
+            ],
+            "removed": ["smalltalk"],
+        },
+    )
+    put = r.put("/tenants/t1/intents/triage").respond(
+        200,
+        json={"tenant_id": "t1", "intent": "triage", "exemplars": ["a", "b"], "source": "api"},
+    )
+    delete = r.delete("/tenants/t1/intents/triage").respond(204)
+
+    listed = admin.intents.list("t1")
+    assert [(i.intent, i.source, i.node) for i in listed.intents] == [
+        ("triage", "api", "node/triage"),
+        ("billing", "config", None),
+    ]
+    assert listed.removed == ["smalltalk"]
+    stored = admin.intents.set("t1", "triage", ["a", "b"])
+    assert json.loads(put.calls.last.request.content) == {"exemplars": ["a", "b"]}
+    assert (stored.tenant_id, stored.source, stored.exemplars) == ("t1", "api", ["a", "b"])
+    admin.intents.set("t1", "triage", [])
+    assert json.loads(put.calls.last.request.content) == {"exemplars": []}
+    assert admin.intents.delete("t1", "triage") is None
+    assert delete.called
+    with pytest.raises(ValueError, match="exemplars"):
+        admin.intents.set("t1", "triage", [""])
+
+
+def test_intent_put_retried_on_502(admin: CalibanAdmin) -> None:
+    put = router(admin).put("/tenants/t1/intents/x")
+    put.side_effect = [
+        httpx.Response(502),
+        httpx.Response(
+            200, json={"tenant_id": "t1", "intent": "x", "exemplars": [], "source": "api"}
+        ),
+    ]
+    admin.intents.set("t1", "x", [])
+    assert put.call_count == 2
+
+
+RAG_DOC = {
+    "tenant_id": "t1",
+    "collection_id": "rc1",
+    "doc_id": "leave",
+    "version": 2,
+    "content_type": "text/markdown",
+    "trust": "untrusted",
+    "bytes": 2048,
+    "status": "quarantined",
+    "chunks": 6,
+    "tokens": 1500,
+    "pii_entities": 3,
+    "findings": [{"kind": "instruction", "chunk": 4, "heading_path": ["Leave", "Exceptions"]}],
+    "findings_acknowledged": False,
+    "attempts": 1,
+    "created_at": TS,
+    "created_by": "admin",
+    "vet_deadline_at": "2026-10-02T10:15:00Z",
+}
+
+
+def test_rag_models_and_collections(admin: CalibanAdmin) -> None:
+    coll = {
+        "id": "rc1",
+        "tenant_id": "t1",
+        "name": "policies",
+        "embedding_model": "local/bge-m3",
+        "settings": {"default_trust": "untrusted", "vet_deadline_secs": 900},
+        "created_at": TS,
+        "created_by": "admin",
+        "document_counts": {"ready": 12, "quarantined": 1},
+    }
+    r = router(admin)
+    r.get("/tenants/t1/rag/models").respond(
+        200,
+        json={
+            "embedding": [{"id": "local/bge-m3", "provider": "gpu", "trust_tier": "t0_sovereign"}],
+            "rerank": [],
+        },
+    )
+    r.get("/tenants/t1/rag/collections").respond(200, json=[coll])
+    r.get("/tenants/t1/rag/collections/policies").respond(
+        200, json={**coll, "document_counts": None, "used_by": ["desk@v2"]}
+    )
+    create = r.post("/tenants/t1/rag/collections").respond(201, json=coll)
+    delete = r.delete("/tenants/t1/rag/collections/policies").respond(204)
+
+    models = admin.rag.models("t1")
+    assert models.embedding[0].trust_tier == "t0_sovereign" and models.rerank == []
+    [c] = admin.rag.collections.list("t1")
+    assert c.document_counts == {"ready": 12, "quarantined": 1}
+    assert c.settings.vet_deadline_secs == 900
+    assert admin.rag.collections.get("t1", "policies").used_by == ["desk@v2"]
+    admin.rag.collections.create(
+        "t1", name="policies", embedding_model="local/bge-m3", settings={"chunk_tokens": 256}
+    )
+    assert json.loads(create.calls.last.request.content) == {
+        "name": "policies",
+        "embedding_model": "local/bge-m3",
+        "settings": {"chunk_tokens": 256},
+    }
+    with pytest.raises(ValueError, match="name"):
+        admin.rag.collections.create("t1", name="Policies!", embedding_model="m")
+    admin.rag.collections.delete("t1", "policies")
+    assert delete.called
+
+
+def test_rag_documents(admin: CalibanAdmin) -> None:
+    base = "/tenants/t1/rag/collections/policies/documents"
+    r = router(admin)
+    ingest = r.post(base).respond(
+        202, json={**RAG_DOC, "status": "pending", "findings": [], "unchanged": False}
+    )
+    listing = r.get(base).respond(
+        200, json={"documents": [{**RAG_DOC, "live_version": 1}], "next_cursor": "c2"}
+    )
+    r.get(f"{base}/leave").respond(
+        200, json={"doc_id": "leave", "live_version": 1, "versions": [RAG_DOC]}
+    )
+    release = r.post(f"{base}/leave/release").respond(
+        200, json={**RAG_DOC, "status": "pending", "findings_acknowledged": True}
+    )
+    delete = r.delete(f"{base}/leave").respond(204)
+
+    doc = admin.rag.documents.ingest(
+        "t1", "policies", doc_id="leave", content="# Leave", trust="untrusted"
+    )
+    assert doc.status == "pending" and doc.unchanged is False
+    assert json.loads(ingest.calls.last.request.content) == {
+        "doc_id": "leave",
+        "content": "# Leave",
+        "trust": "untrusted",
+    }
+    page = admin.rag.documents.list("t1", "policies", status="quarantined", limit=10)
+    assert dict(listing.calls.last.request.url.params) == {"status": "quarantined", "limit": "10"}
+    assert page.documents[0].live_version == 1 and page.next_cursor == "c2"
+
+    v = admin.rag.documents.get("t1", "policies", "leave").versions[0]
+    assert v.vet_deadline_at is not None and v.vet_deadline_at.minute == 15
+    assert v.findings[0].heading_path == ["Leave", "Exceptions"]
+
+    released = admin.rag.documents.release("t1", "policies", "leave", version=2)
+    assert json.loads(release.calls.last.request.content) == {
+        "version": 2,
+        "acknowledge_findings": True,
+    }
+    assert released.findings_acknowledged is True
+    admin.rag.documents.delete("t1", "policies", "leave")
+    assert delete.called
 
 
 def test_nodes_create_validates_locally(admin: CalibanAdmin) -> None:
