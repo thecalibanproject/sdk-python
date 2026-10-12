@@ -697,3 +697,28 @@ def test_node_trial_untrusted_marks_and_input_labels(tmp_path: Path) -> None:
     ok = completion_body("ok")
     chat = run_eval(model_ds, make_client(lambda r: httpx.Response(200, json=ok)), k=1)
     assert any("node targets only" in w for w in chat.warnings)
+
+
+def test_node_trial_reports_model_cost_pii_and_answer_guard() -> None:
+    ds = Dataset.model_validate(
+        {"name": "g", "cases": [{"id": "a", "input": "q", "expected": "ok"}]}
+    )
+    guarded = run_body(
+        model_cost_usd=0.0007,
+        usage={"prompt_tokens": 30, "completion_tokens": 7, "total_tokens": 37, "pii_entities": 4},
+        answer_check={
+            "labels": ["datasource"],
+            "findings": [{"rule": "untrusted_link", "label": "datasource", "at": ""}],
+            "action": "redacted",
+        },
+    )
+    report = run_eval(ds, make_client(lambda r: httpx.Response(200, json=guarded)), node="geo-node")
+    t = report.cases[0].trials[0]
+    assert (t.cost_usd, t.model_cost_usd) == (0.002, 0.0007)
+    assert (t.pii_entities, t.answer_check) == (4, "redacted")
+
+    plain = run_eval(
+        ds, make_client(lambda r: httpx.Response(200, json=run_body())), node="geo-node"
+    )
+    t = plain.cases[0].trials[0]
+    assert (t.model_cost_usd, t.pii_entities, t.answer_check) == (None, None, None)

@@ -106,6 +106,14 @@ class Trial(BaseModel):
     input_labels: list[str] | None = None
     """Node targets: taint labels the run input carried from the start (``caller`` when it
     held untrusted caller data)."""
+    model_cost_usd: float | None = None
+    """Node targets: the real cost of the models the run's calls were routed to (equals
+    ``cost_usd``, what the run is billed, unless it is billed as ``caliban/auto``)."""
+    pii_entities: int | None = None
+    """Node targets: personal-data entities the gateway protected in the run's model calls."""
+    answer_check: str | None = None
+    """Node targets: what the answer guard did with an output that carried untrusted labels
+    (``passed``, ``redacted`` or ``refused``). ``None`` when it did not apply."""
 
 
 class CaseResult(BaseModel):
@@ -233,6 +241,15 @@ class _RunAwaiting(BaseModel):
     question: str | None = None
 
 
+class _RunUsage(CompletionUsage):
+    pii_entities: int | None = None
+
+
+class _AnswerCheck(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    action: str | None = None
+
+
 class _NodeRun(BaseModel):
     """The parts of ``components.schemas.NodeRun`` a trial needs."""
 
@@ -247,8 +264,10 @@ class _NodeRun(BaseModel):
     awaiting: _RunAwaiting | None = None
     budget: dict[str, Any] = Field(default_factory=dict)
     cost_usd: float | None = None
-    usage: CompletionUsage | None = None
+    model_cost_usd: float | None = None
+    usage: _RunUsage | None = None
     input_labels: list[str] | None = None
+    answer_check: _AnswerCheck | None = None
 
 
 _RUN = TypeAdapter(_NodeRun)
@@ -387,6 +406,9 @@ def _run_node_trial(
         run_id=run.id,
         run_status=run.status,
         input_labels=run.input_labels,
+        model_cost_usd=run.model_cost_usd,
+        pii_entities=run.usage.pii_entities if run.usage else None,
+        answer_check=run.answer_check.action if run.answer_check else None,
     )
 
 

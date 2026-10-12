@@ -219,15 +219,32 @@ class CalibanResponseMeta(BaseModel):
     intent: IntentDecision | None = None
     """``x-caliban-intent``, parsed. ``None`` when absent or malformed."""
     pii_entities: int | None = None
+    """``x-caliban-pii-entities``: entities protected (for a node answer, across the run's
+    model calls)."""
     cost_usd: float | None = None
     """``x-caliban-cost-usd``: cost of the request in USD. Sent on non-streaming responses
-    when the model has a price; ``None`` otherwise (streams report cost in usage events)."""
+    when the model has a price; ``None`` otherwise (streams report cost in usage events). For
+    a node answer, the routed models' real cost (the run's ``model_cost_usd``)."""
+    billed_usd: float | None = None
+    """``x-caliban-billed-usd``: what a non-streaming node answer is billed (the run's
+    ``cost_usd``). ``None`` otherwise."""
+    route: str | None = None
+    """``x-caliban-route``: ``node/<name>@v<N>`` when a node answered, ``model:<id>`` when
+    ``caliban/auto`` answered with a model for a tenant that maps intents to nodes."""
+    route_fallback: str | None = None
+    """``x-caliban-route-fallback``: why ``caliban/auto`` answered with a model rather than a
+    node (``low_confidence``, ``no_node_for_intent``, ...)."""
+    run_id: str | None = None
+    """``Caliban-Run-Id``: the node run that answered."""
+    run_status: str | None = None
+    """``x-caliban-run-status``: the status of that run."""
     headers: dict[str, str] = Field(default_factory=dict)
     """All ``x-caliban-*`` headers, lower-cased, verbatim."""
 
     @classmethod
     def from_headers(cls, headers: Mapping[str, str]) -> CalibanResponseMeta:
         cal = {k.lower(): v for k, v in headers.items() if k.lower().startswith("x-caliban-")}
+        run_id = next((v for k, v in headers.items() if k.lower() == "caliban-run-id"), None)
         return cls(
             request_id=cal.get("x-caliban-request-id"),
             routed_model=cal.get("x-caliban-routed-model"),
@@ -236,8 +253,18 @@ class CalibanResponseMeta(BaseModel):
             intent=IntentDecision.parse(cal.get("x-caliban-intent")),
             pii_entities=_to_int(cal.get("x-caliban-pii-entities")),
             cost_usd=_to_float(cal.get("x-caliban-cost-usd")),
+            billed_usd=_to_float(cal.get("x-caliban-billed-usd")),
+            route=_text(cal.get("x-caliban-route")),
+            route_fallback=_text(cal.get("x-caliban-route-fallback")),
+            run_id=_text(run_id),
+            run_status=_text(cal.get("x-caliban-run-status")),
             headers=cal,
         )
+
+
+def _text(v: str | None) -> str | None:
+    v = (v or "").strip()
+    return v or None
 
 
 def _to_int(v: str | None) -> int | None:

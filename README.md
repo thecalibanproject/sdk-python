@@ -117,7 +117,14 @@ The gateway reports what it did in `x-caliban-*` response headers. Completions, 
 | `x-caliban-cache-tier` | `cache_tier` | `"exact"` or `"semantic"`, sent on hits only. `None` otherwise. |
 | `x-caliban-intent` | `intent` | The routing decision, parsed into an `IntentDecision` (`intent`, `confidence`, `stage`, `knn_reason`). `None` when absent or malformed. |
 | `x-caliban-pii-entities` | `pii_entities` | Number of PII entities detected and protected. |
-| `x-caliban-cost-usd` | `cost_usd` | Non-streaming responses only; `None` when the model has no price. |
+| `x-caliban-cost-usd` | `cost_usd` | Non-streaming responses only; `None` when the model has no price. For a node answer, the routed models' real cost (the run's `model_cost_usd`). |
+| `x-caliban-billed-usd` | `billed_usd` | Non-streaming node answers: what the run is billed (its `cost_usd`). |
+| `x-caliban-route` | `route` | `node/<name>@v<N>` when a node answered, `model:<id>` when `caliban/auto` answered with a model for a tenant that maps intents to nodes. |
+| `x-caliban-route-fallback` | `route_fallback` | Why `caliban/auto` answered with a model rather than a node (`low_confidence`, `no_node_for_intent`, ...). |
+| `Caliban-Run-Id` | `run_id` | The node run that answered. |
+| `x-caliban-run-status` | `run_status` | Its status, for example `succeeded` or `input_required`. |
+
+A node answer (`model="node/<name>"`, or `caliban/auto` handing the request to a node) carries the headers of every chat response: `request_id`, `routed_model` (`node/<name>@v<N>`), `cache="bypass"`, and on non-streaming answers `pii_entities` (the entities protected across the run's model calls), `cost_usd` and `billed_usd`.
 
 `headers` holds every `x-caliban-*` header, lower-cased. Response models allow extra fields, so provider-specific fields survive (see `resp.model_extra`).
 
@@ -557,6 +564,7 @@ A node target (`--node name`, `--node name@vN`, `node:` in the dataset defaults 
 - A trial passes when the run succeeds and every check passes. A run that fails, exhausts its budget or is cancelled fails the trial, and its cost counts.
 - `answers` script human steps, by step id (`clarify#0`, `write#0@approve`) or vertex id (`clarify`, `write@approve`). A question without an answer cancels the run and fails the trial; an approval without one is denied.
 - `untrusted` (in the defaults or per case: `true`, or JSON pointers into the input) is sent on the run to mark untrusted caller data; each trial reports the run's `input_labels` (`caller` when marked data was present).
+- Each trial reports `cost_usd` (what the run is billed), `model_cost_usd` (the real cost of the models its calls were routed to; they differ only for runs billed as `caliban/auto`), `pii_entities` (entities the gateway protected in the run's model calls) and `answer_check` (`passed`, `redacted` or `refused`: what the node's answer guard did when the output carried untrusted labels; `None` when it did not apply).
 - A run still going after `--run-timeout` seconds (default 600) is cancelled and counted as an error.
 - `temperature`, `max_tokens` and `caliban` do not apply: the node's spec decides. The report warns when they are set.
 

@@ -1,4 +1,4 @@
-"""Parsing of the ``x-caliban-cache-tier`` and ``x-caliban-intent`` response headers."""
+"""Parsing of the ``x-caliban-*`` response headers (cache tier, intent, node answers)."""
 
 from __future__ import annotations
 
@@ -145,3 +145,51 @@ def test_exposed_on_async_completions() -> None:
     resp = asyncio.run(run())
     assert resp.caliban.cache_tier == "exact"
     assert resp.caliban.intent == EXPECTED
+
+
+NODE_ANSWER = {
+    "x-caliban-request-id": "req_7",
+    "x-caliban-routed-model": "node/triage@v3",
+    "x-caliban-cache": "bypass",
+    "x-caliban-pii-entities": "2",
+    "x-caliban-cost-usd": "0.0011",
+    "x-caliban-billed-usd": "0.004",
+    "x-caliban-route": "node/triage@v3",
+    "x-caliban-run-status": "succeeded",
+    "Caliban-Run-Id": "run_9",
+}
+
+
+def test_meta_on_a_node_answer() -> None:
+    meta = CalibanResponseMeta.from_headers(NODE_ANSWER)
+    assert (meta.request_id, meta.routed_model, meta.cache) == ("req_7", "node/triage@v3", "bypass")
+    assert (meta.pii_entities, meta.cost_usd, meta.billed_usd) == (2, 0.0011, 0.004)
+    assert (meta.route, meta.route_fallback) == ("node/triage@v3", None)
+    assert (meta.run_id, meta.run_status) == ("run_9", "succeeded")
+    # Caliban-Run-Id is not an x-caliban-* header, so it is not in `headers`.
+    assert "caliban-run-id" not in meta.headers
+
+
+def test_meta_caliban_auto_fallback_and_malformed_node_headers() -> None:
+    meta = CalibanResponseMeta.from_headers(
+        {"x-caliban-route": "model:local/qwen3-8b", "x-caliban-route-fallback": "low_confidence"}
+    )
+    assert (meta.route, meta.route_fallback, meta.run_id) == (
+        "model:local/qwen3-8b",
+        "low_confidence",
+        None,
+    )
+    bad = CalibanResponseMeta.from_headers(
+        {"x-caliban-billed-usd": "free", "x-caliban-route": "  ", "caliban-run-id": ""}
+    )
+    assert (bad.billed_usd, bad.route, bad.run_id, bad.run_status) == (None, None, None, None)
+    assert CalibanResponseMeta.from_headers({"x-caliban-billed-usd": "-1"}).billed_usd is None
+
+
+def test_node_answer_meta_on_completions() -> None:
+    client = make_client(lambda r: httpx.Response(200, json=completion_body(), headers=NODE_ANSWER))
+    resp = client.chat.completions.create(
+        model="node/triage", messages=[{"role": "user", "content": "hi"}]
+    )
+    assert (resp.caliban.run_id, resp.caliban.billed_usd) == ("run_9", 0.004)
+    assert resp.caliban.pii_entities == 2
