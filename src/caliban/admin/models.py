@@ -152,7 +152,10 @@ DatasourceKind = Literal[
     "s3_parquet",
     "mcp",
 ]
-DatasourceStatus = Literal["pending", "connected", "error", "introspecting"]
+DatasourceStatus = Literal["pending", "introspecting", "ready", "failed", "connected", "error"]
+"""``pending`` when created; ``introspecting`` while an introspection job runs, then ``ready``
+or ``failed`` (see the job's ``error``). ``connected`` and ``error`` are reserved: core does not
+set them yet."""
 OntologyElementKind = Literal[
     "entity",
     "attribute",
@@ -483,7 +486,12 @@ IntrospectionStatus = Literal["running", "succeeded", "failed"]
 
 
 class IntrospectionJob(_Response):
-    """An ontology bootstrap job of a datasource (``components.schemas.IntrospectionJob``)."""
+    """An ontology bootstrap job of a datasource (``components.schemas.IntrospectionJob``).
+
+    Jobs are stored, so every control-plane replica answers. A job whose control plane stopped
+    before it ended shows as ``failed`` once it is older than the job timeout (10 minutes) and a
+    minute. Fields are optional here for older servers; current ones always send them, except
+    ``error`` and ``finished_at``."""
 
     id: str | None = None
     datasource_id: str | None = None

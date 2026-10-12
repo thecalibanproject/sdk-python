@@ -148,6 +148,9 @@ def test_models_datasources_introspect(admin: CalibanAdmin) -> None:
         tenant_id="t1", kind="postgres", name="dw", connection={"dsn": "postgres://x"}
     )
     assert json.loads(post.calls.last.request.content)["connection"] == {"dsn": "postgres://x"}
+    # The statuses introspection sets.
+    for status in ("introspecting", "ready", "failed"):
+        assert m.Datasource.model_validate({**ds, "status": status}).status == status
     assert admin.datasources.introspect("d1").job_id == "j1"
 
 

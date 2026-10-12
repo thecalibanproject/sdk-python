@@ -460,13 +460,18 @@ class Datasources(_Resource):
         The control plane connects with the datasource's credentials, checks the principal is
         read only, samples every collection and writes proposals (``status="proposed"``) in one
         ontology version; elements a human already reviewed, and unchanged ones, are skipped.
-        MongoDB only. Follow the job with :meth:`introspection`.
+        MongoDB only. Follow the job with :meth:`introspection`. Raises
+        :class:`~caliban.ConflictError` while a job of the datasource runs, on any replica.
         """
         return self._one(IntrospectJob, self._post(f"datasources/{_p(datasource_id)}/introspect"))
 
     def introspection(self, datasource_id: str) -> IntrospectionJob:
-        """The newest introspection job of the datasource (answered by the control plane that
-        ran it). Raises :class:`~caliban.NotFoundError` when there is none."""
+        """The newest introspection job of the datasource.
+
+        Jobs are stored, so every control-plane replica answers; a job whose control plane
+        stopped before it ended shows as ``failed`` once it is older than the job timeout (10
+        minutes) and a minute, and may be started again. Raises
+        :class:`~caliban.NotFoundError` when there is none."""
         return self._one(
             IntrospectionJob, self._get(f"datasources/{_p(datasource_id)}/introspection")
         )
