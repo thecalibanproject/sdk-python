@@ -1438,6 +1438,27 @@ def test_tenant_pii_patterns_dictionary_and_sovereign(admin: CalibanAdmin) -> No
     assert patch.call_count == calls
 
 
+def test_tenant_pii_detectors_only_with_tenant_write(admin: CalibanAdmin) -> None:
+    # A caller without tenant.write gets the counts, never the patterns or the dictionary.
+    reader = {**TENANT, "pii_patterns_count": 2, "pii_dictionary_count": 40}
+    writer = {
+        **reader,
+        "pii_patterns": [{"label": "phone", "pattern": "\\+961[0-9]{8}"}],
+        "pii_dictionary": [],
+    }
+    r = router(admin)
+    r.get("/tenants").respond(200, json=[reader])
+    r.get("/tenants/t1").respond(200, json=writer)
+
+    (t,) = admin.tenants.list()
+    assert (t.pii_patterns, t.pii_dictionary) == (None, None)
+    assert (t.pii_patterns_count, t.pii_dictionary_count) == (2, 40)
+    w = admin.tenants.get("t1")
+    # Labels are case-insensitive: stored as sent, used upper-cased (phone is PHONE).
+    assert w.pii_patterns is not None and w.pii_patterns[0].label == "phone"
+    assert w.pii_dictionary == [] and w.pii_dictionary_count == 40
+
+
 def test_usage_by_purpose(admin: CalibanAdmin) -> None:
     rag_event = {**USAGE_BASE, "model": "local/bge-m3", "purpose": "rag.search"}
     router(admin).get("/usage").respond(

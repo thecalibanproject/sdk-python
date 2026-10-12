@@ -234,8 +234,11 @@ class PiiPattern(_Request):
     model_config = ConfigDict(extra="ignore")
 
     label: PiiLabel
-    """``NATIONAL_ID``, ``PHONE``, ``EMAIL``, ``PERSON``, ``ORG``, ``LOCATION``, ``IBAN`` or
-    ``CARD`` use the built-in surrogates; other labels get shape-preserving ones."""
+    """Case-insensitive: stored as sent, used upper-cased (``phone`` is ``PHONE``).
+    ``NATIONAL_ID``, ``PHONE``, ``EMAIL``, ``PERSON``, ``ORG``, ``LOCATION``, ``IBAN`` or
+    ``CARD`` (and the aliases ``ID``, ``NATIONALID``, ``NAME``, ``ORGANIZATION``,
+    ``ADDRESS``) use the built-in surrogates; other labels get shape-preserving ones and are
+    masked as ``[LABEL]``, upper-cased."""
     pattern: str = Field(max_length=500)
     """Rust ``regex`` syntax (linear time: no backreferences or lookaround); must not match
     the empty string."""
@@ -248,6 +251,7 @@ class PiiTerm(_Request):
 
     term: str = Field(min_length=2, max_length=200)
     label: PiiLabel
+    """Case-insensitive, as for :attr:`PiiPattern.label`."""
 
 
 class Health(_Response):
@@ -270,7 +274,17 @@ class Tenant(_Response):
     """The PII mode also applies to sovereign and attested models. ``None`` from older
     servers."""
     pii_patterns: list[PiiPattern] | None = None
+    """Only for callers with ``tenant.write`` on the tenant (``None`` for others, and from
+    older servers): read :attr:`pii_patterns_count` to see whether the tenant has any."""
     pii_dictionary: list[PiiTerm] | None = None
+    """Only for callers with ``tenant.write`` (the dictionary may hold staff or customer
+    names); others get :attr:`pii_dictionary_count`."""
+    pii_patterns_count: int | None = None
+    """How many patterns the tenant has, for every caller of ``tenants.get`` and
+    ``tenants.list``. ``None`` from older servers (and on create and update results)."""
+    pii_dictionary_count: int | None = None
+    """How many dictionary terms the tenant has, for every caller of ``tenants.get`` and
+    ``tenants.list``. ``None`` from older servers (and on create and update results)."""
     auto_cache_hit_fraction: float | None = None
     """Share of the flat ``caliban/auto`` price billed for this tenant's cache hits, 0..1.
     ``None``: the deployment's ``[routing] auto_cache_hit_fraction`` (0.2 unless configured)
