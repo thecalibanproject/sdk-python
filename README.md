@@ -414,11 +414,24 @@ print(spec.to_yaml())
 - `graph` is allowed only for `kind: workflow`, and a workflow needs vertices;
 - `agent` (the tool loop settings, `max_turns`) is allowed only for `kind: agent`;
 - vertex ids are unique, and edges and `graph.entry` reference existing vertices;
-- every loop contains a vertex with `max_iterations`.
+- every loop contains a vertex with `max_iterations`;
+- a vertex's `config.reasoning` is `off`, `low`, `medium` or `high`, and its `config.structured_output` is `json_schema` or `prompt`.
 
-Tool refs are `mcp://server/tool#sha256:<hash>`, `node://name@vN` or `builtin://datasource_query`. `budgets.usd` caps what one run may spend on model calls; `guards` sets the loop guard (`max_repeats`, default 3) and transient tool retries (`tool_retries`, default 2).
+Tool refs are `mcp://server/tool#sha256:<hash>`, `node://name@vN`, `builtin://datasource_query` or `builtin://rag_search` (a document collection, scoped as `rag.<collection>:read`). `budgets.usd` caps what one run may spend on model calls; `guards` sets the loop guard (`max_repeats`, default 3) and transient tool retries (`tool_retries`, default 2).
 
-`lint` warns about unknown nested keys, MCP tools not pinned with `#sha256:`, node tools not pinned with `@vN`, unknown or write-effect `builtin://` tools, `builtin://datasource_query` without `datasources.scopes`, `allow_tainted` on a built-in or node read tool (it applies to writes and to MCP reads that reach the network), `code` vertices (core refuses them at publish), and write tools without an injection defence. See [`tests/fixtures/invoice-triage.node.yaml`](tests/fixtures/invoice-triage.node.yaml) for a full example. Once published, a node is called from the data plane with `model="node/invoice-triage"` (the live version) or `model="node/invoice-triage@v3"` on chat completions, or through the run API (`POST /v1/nodes/{name}/runs`). The `caliban.node` field does not run a node. To mark input fields as untrusted caller data whoever calls, put `"x-caliban-untrusted": true` on them in `prompt.input_schema`; a caller marks more with `caliban.untrusted` (or `untrusted` on the run API). The node design is described in [research note 04](https://github.com/thecalibanproject/docs/blob/main/research/04-agent-orchestration.md).
+**Reasoning, constrained decoding and guardrails.** `model_policy.reasoning` (`off`, `low`, `medium`, `high`) is the default reasoning effort of the node's model calls; a model vertex's `config.reasoning` (`llm`, `router`, `verify`, `reduce` with mode `llm`; `MODEL_VERTICES`) overrides it, and the gateway maps it per model family. `config.structured_output` is `json_schema` (the default: the vertex's `output_schema`, or a router's labels, go as `response_format` so vLLM, SGLang and OpenAI constrain decoding) or `prompt` (the schema in the prompt only, for servers without guided decoding); the answer is validated either way. `guardrails.answer` (`redact`, the default, `refuse` or `off`) is the answer guard on the run's final output when it carries untrusted labels: links, contacts and references that only untrusted free text supplied, and echoes of injected instructions, are removed or fail the run. `guardrails.pii` is a floor on the PII protection of the node's model calls on every model class, sovereign models included, and of untrusted tool arguments and results; it only strengthens the tenant's mode.
+
+```yaml
+model_policy: { reasoning: low }
+guardrails: { answer: refuse, pii: mask }
+graph:
+  vertices:
+    - { id: route, type: router, config: { routes: { urgent: Needs care now, routine: Can wait }, reasoning: "off" } }
+    - { id: advise, type: llm, config: { output_schema: { type: object }, reasoning: high, structured_output: json_schema } }
+  edges: [{ from: route, to: advise }]
+```
+
+`lint` warns about unknown nested keys, MCP tools not pinned with `#sha256:`, node tools not pinned with `@vN`, unknown or write-effect `builtin://` tools, `builtin://datasource_query` without `datasources.scopes`, `builtin://rag_search` without a `rag.<collection>:read` scope, `reasoning` or `structured_output` on a vertex that calls no model, `allow_tainted` on a built-in or node read tool (it applies to writes and to MCP reads that reach the network), `code` vertices (core refuses them at publish), and write tools without an injection defence. See [`tests/fixtures/invoice-triage.node.yaml`](tests/fixtures/invoice-triage.node.yaml) for a full example. Once published, a node is called from the data plane with `model="node/invoice-triage"` (the live version) or `model="node/invoice-triage@v3"` on chat completions, or through the run API (`POST /v1/nodes/{name}/runs`). The `caliban.node` field does not run a node. To mark input fields as untrusted caller data whoever calls, put `"x-caliban-untrusted": true` on them in `prompt.input_schema`; a caller marks more with `caliban.untrusted` (or `untrusted` on the run API). The node design is described in [research note 04](https://github.com/thecalibanproject/docs/blob/main/research/04-agent-orchestration.md).
 
 ### Evals (golden sets, pass^k)
 

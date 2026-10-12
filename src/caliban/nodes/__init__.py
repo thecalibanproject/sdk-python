@@ -2,7 +2,9 @@
 
 from .spec import (
     BUILTIN_TOOLS,
+    MODEL_VERTICES,
     AgentLoop,
+    AnswerGuard,
     Budgets,
     DatasourceScopes,
     Edge,
@@ -17,6 +19,8 @@ from .spec import (
     NodeSpec,
     NodeValidationError,
     Prompt,
+    Reasoning,
+    StructuredOutput,
     ToolRef,
     Vertex,
     json_schema,
@@ -28,7 +32,9 @@ from .spec import (
 
 __all__ = [
     "BUILTIN_TOOLS",
+    "MODEL_VERTICES",
     "AgentLoop",
+    "AnswerGuard",
     "Budgets",
     "DatasourceScopes",
     "Edge",
@@ -43,6 +49,8 @@ __all__ = [
     "NodeSpec",
     "NodeValidationError",
     "Prompt",
+    "Reasoning",
+    "StructuredOutput",
     "ToolRef",
     "Vertex",
     "json_schema",

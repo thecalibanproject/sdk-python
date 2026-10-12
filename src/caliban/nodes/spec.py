@@ -14,14 +14,16 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, Strict
+from pydantic import BaseModel, ConfigDict, Field, Strict, field_validator
 from pydantic import ValidationError as PydanticValidationError
 
 from ..errors import CalibanError
 
 __all__ = [
     "BUILTIN_TOOLS",
+    "MODEL_VERTICES",
     "AgentLoop",
+    "AnswerGuard",
     "Budgets",
     "DatasourceScopes",
     "Edge",
@@ -36,6 +38,8 @@ __all__ = [
     "NodeSpec",
     "NodeValidationError",
     "Prompt",
+    "Reasoning",
+    "StructuredOutput",
     "ToolRef",
     "Vertex",
     "json_schema",
@@ -46,6 +50,13 @@ __all__ = [
 ]
 
 TrustTier = Literal["t0_sovereign", "t1_attested", "t2_contracted", "t3_public"]
+Reasoning = Literal["off", "low", "medium", "high"]
+"""Reasoning effort of a node's model calls, mapped per model family by the gateway."""
+StructuredOutput = Literal["json_schema", "prompt"]
+"""``json_schema`` (default): constrained decoding on the server; ``prompt``: the schema in the
+prompt only."""
+AnswerGuard = Literal["redact", "refuse", "off"]
+"""``guardrails.answer``: ``redact`` (default), ``refuse`` or ``off``."""
 StrictInt = Annotated[int, Strict()]
 StrictBool = Annotated[bool, Strict()]
 StrictFloat = Annotated[float, Strict()]
@@ -74,16 +85,19 @@ class ModelPolicy(_Open):
     escalate_on: list[Literal["schema_violation", "low_confidence", "tool_error"]] | None = None
     max_cost_usd: Annotated[StrictFloat, Field(ge=0)] | None = None
     min_trust_tier: TrustTier | None = None
+    reasoning: Reasoning | None = None
+    """Default reasoning effort of the node's model calls; a vertex's ``config.reasoning``
+    overrides it."""
 
 
-BUILTIN_TOOLS: tuple[str, ...] = ("datasource_query",)
+BUILTIN_TOOLS: tuple[str, ...] = ("datasource_query", "rag_search")
 """Tools Caliban provides itself, referenced as ``builtin://<name>`` (read only)."""
 
 
 class ToolRef(_Open):
     ref: Annotated[str, Field(pattern=r"^(mcp|node|builtin)://")]
-    """``mcp://server/tool#sha256:<hash>`` (an approved manifest), ``node://name@vN``
-    or ``builtin://datasource_query``."""
+    """``mcp://server/tool#sha256:<hash>`` (an approved manifest), ``node://name@vN``,
+    ``builtin://datasource_query`` or ``builtin://rag_search``."""
     effect: Literal["read", "write"]
     requires: list[str] | None = None
     allow_tainted: list[str] | None = None
@@ -94,6 +108,8 @@ class ToolRef(_Open):
 
 class DatasourceScopes(_Open):
     scopes: list[Scope] | None = None
+    """``<datasource>.<object or *>:<read|write>`` for datasources;
+    ``rag.<collection or *>:read`` for document collections (``builtin://rag_search``)."""
 
 
 class LongTermMemory(_Open):
@@ -107,7 +123,14 @@ class Memory(_Open):
 
 
 class Guardrails(_Open):
+    answer: AnswerGuard | None = None
+    """The answer guard on the run's final output when it carries untrusted labels: links,
+    contacts and references only untrusted free text supplied, and echoes of injected
+    instructions, are removed (``redact``, the server default) or fail the run (``refuse``)."""
     pii: Literal["off", "mask", "reversible"] | None = None
+    """A floor on the PII protection of the node's model calls on every model class
+    (sovereign models included), and of untrusted tool arguments and results. Only
+    strengthens the tenant's mode."""
     injection_mode: Literal["none", "plan_then_execute", "camel"] | None = None
     egress: list[str] | None = None
 
@@ -147,6 +170,13 @@ class Exposure(_Open):
 
 
 VertexType = Literal["llm", "tool", "router", "map", "reduce", "verify", "human", "subnode", "code"]
+MODEL_VERTICES: tuple[str, ...] = ("llm", "router", "verify", "reduce")
+"""Vertex types that call a model (``reduce`` with mode ``llm``) and take ``config.reasoning``
+and ``config.structured_output``."""
+_CONFIG_ENUMS: dict[str, tuple[str, ...]] = {
+    "reasoning": ("off", "low", "medium", "high"),
+    "structured_output": ("json_schema", "prompt"),
+}
 
 
 class Vertex(_Open):
@@ -154,7 +184,17 @@ class Vertex(_Open):
     type: VertexType
     """``code`` is not yet supported (core refuses it at publish)."""
     config: dict[str, Any] | None = None
+    """Per vertex type. Model vertices also take ``reasoning`` (overrides
+    ``model_policy.reasoning``) and ``structured_output`` (``json_schema`` or ``prompt``)."""
     max_iterations: Annotated[StrictInt, Field(ge=1)] | None = None
+
+    @field_validator("config")
+    @classmethod
+    def _check_config_enums(cls, v: dict[str, Any] | None) -> dict[str, Any] | None:
+        for key, allowed in _CONFIG_ENUMS.items():
+            if v is not None and key in v and v[key] not in allowed:
+                raise ValueError(f"{key} must be one of {', '.join(allowed)}")
+        return v
 
 
 class Edge(_Open):
@@ -346,8 +386,11 @@ def lint(spec: NodeSpec) -> list[str]:
                 warnings.append(f"tools[{i}].ref: unknown built-in tool (known: {known})")
             if tool.effect != "read":
                 warnings.append(f"tools[{i}].effect: built-in tools are read only")
-            if name == "datasource_query" and not (spec.datasources and spec.datasources.scopes):
+            scopes = spec.datasources.scopes if spec.datasources else None
+            if name == "datasource_query" and not scopes:
                 warnings.append(f"tools[{i}].ref: datasource_query needs datasources.scopes")
+            if name == "rag_search" and not any(s.startswith("rag.") for s in scopes or []):
+                warnings.append(f"tools[{i}].ref: rag_search needs a rag.<collection>:read scope")
         if (
             tool.allow_tainted is not None
             and tool.effect != "write"
@@ -364,6 +407,12 @@ def lint(spec: NodeSpec) -> list[str]:
             warnings.append(
                 f"graph.vertices[{i}].type: code is not yet supported (refused at publish)"
             )
+        for key in _CONFIG_ENUMS:
+            if vertex.config and key in vertex.config and vertex.type not in MODEL_VERTICES:
+                warnings.append(
+                    f"graph.vertices[{i}].config.{key}: only model vertices "
+                    f"({', '.join(MODEL_VERTICES)}) call a model"
+                )
     has_write = any(t.effect == "write" for t in spec.tools or [])
     mode = spec.guardrails.injection_mode if spec.guardrails else None
     if has_write and mode in (None, "none"):

@@ -98,6 +98,8 @@ def test_unknown_top_level_key_rejected() -> None:
         ("memory.short_term", "forever"),
         ("guardrails.injection_mode", "pray"),
         ("guardrails.pii", "anonymize"),
+        ("guardrails.answer", "block"),
+        ("model_policy.reasoning", "max"),
         ("exposure.http", "yes"),
         ("prompt.input_schema", "not-an-object"),
         ("model_policy.model", 5),
@@ -298,7 +300,8 @@ def test_lint_builtin_tools_and_taint() -> None:
     )
     assert lint(spec) == [
         "tools[0].ref: datasource_query needs datasources.scopes",
-        "tools[1].ref: unknown built-in tool (known: builtin://datasource_query)",
+        "tools[1].ref: unknown built-in tool (known: builtin://datasource_query, "
+        "builtin://rag_search)",
         "tools[1].effect: built-in tools are read only",
         "tools[2].allow_tainted: only applies to writes and to MCP reads that reach the network",
     ]
@@ -337,3 +340,65 @@ def test_spec_all_matches_package_exports() -> None:
     import caliban.nodes.spec
 
     assert sorted(caliban.nodes.spec.__all__) == sorted(caliban.nodes.__all__)
+
+
+def test_reasoning_structured_output_and_answer_guard() -> None:
+    spec = validate(
+        _workflow(
+            [
+                {
+                    "id": "route",
+                    "type": "router",
+                    "config": {"routes": {"a": "x"}, "reasoning": "off"},
+                },
+                {
+                    "id": "advise",
+                    "type": "llm",
+                    "config": {"reasoning": "high", "structured_output": "prompt"},
+                },
+            ],
+            [{"from": "route", "to": "advise"}],
+        )
+        | {"model_policy": {"reasoning": "low"}, "guardrails": {"answer": "refuse", "pii": "mask"}}
+    )
+    assert spec.model_policy.reasoning == "low"
+    assert spec.guardrails is not None
+    assert (spec.guardrails.answer, spec.guardrails.pii) == ("refuse", "mask")
+    assert spec.graph is not None and spec.graph.vertices is not None
+    assert spec.graph.vertices[1].config == {"reasoning": "high", "structured_output": "prompt"}
+    assert lint(spec) == []
+    assert validate(spec.to_dict()) == spec
+
+
+@pytest.mark.parametrize(
+    ("config", "issue"),
+    [
+        ({"reasoning": "max"}, "reasoning must be one of off, low, medium, high"),
+        ({"structured_output": "grammar"}, "structured_output must be one of json_schema, prompt"),
+    ],
+)
+def test_vertex_config_enums(config: dict[str, Any], issue: str) -> None:
+    issues = issues_of(_workflow([{"id": "a", "type": "llm", "config": config}], []))
+    assert len(issues) == 1
+    assert issues[0].startswith("graph.vertices[0].config:")
+    assert issue in issues[0]
+
+
+def test_lint_config_on_non_model_vertex_and_rag_scope() -> None:
+    spec = validate(
+        _workflow([{"id": "fetch", "type": "tool", "config": {"reasoning": "low"}}], [])
+        | {"tools": [{"ref": "builtin://rag_search", "effect": "read"}]}
+    )
+    assert lint(spec) == [
+        "tools[0].ref: rag_search needs a rag.<collection>:read scope",
+        "graph.vertices[0].config.reasoning: only model vertices (llm, router, verify, reduce) "
+        "call a model",
+    ]
+    scoped = validate(
+        {
+            **MINIMAL,
+            "tools": [{"ref": "builtin://rag_search", "effect": "read"}],
+            "datasources": {"scopes": ["rag.policies:read"]},
+        }
+    )
+    assert lint(scoped) == []
