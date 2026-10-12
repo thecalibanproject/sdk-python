@@ -54,6 +54,7 @@ __all__ = [
     "InjectionCategoryName",
     "InjectionDefense",
     "InjectionEvidence",
+    "InjectionReadOnly",
     "InjectionSummary",
     "InjectionVerdict",
     "IntentExemplars",
@@ -84,7 +85,9 @@ __all__ = [
     "OntologyReview",
     "OntologyReviewResult",
     "PiiMode",
+    "PiiPattern",
     "PiiSurrogateScope",
+    "PiiTerm",
     "Problem",
     "ProblemKind",
     "ProviderHealth",
@@ -116,7 +119,9 @@ __all__ = [
     "TenantUpdate",
     "TrialError",
     "TrustTier",
+    "UsageByPurpose",
     "UsageEvent",
+    "UsagePurpose",
     "UsageReport",
     "UsageTotals",
     "VerdictCheck",
@@ -164,6 +169,7 @@ RagDocumentStatus = Literal[
     "pending", "indexing", "ready", "quarantined", "failed", "superseded", "deleted"
 ]
 EvalSuite = Literal["golden", "injection"]
+InjectionReadOnly = Literal["required", "optional"]
 EvalStatus = Literal["pending", "running", "succeeded", "failed", "cancelled"]
 EvalTrialStatus = Literal["running", "passed", "failed", "error"]
 RunStatus = Literal[
@@ -184,8 +190,14 @@ InjectionCategoryName = Literal[
     "replay",
     "subnode",
     "caller_data",
+    "answer_integrity",
 ]
-InjectionDefense = Literal["approval_required", "pii_guard", "declared_tools_only", "manifest_scan"]
+InjectionDefense = Literal[
+    "approval_required", "pii_guard", "declared_tools_only", "manifest_scan", "answer_guard"
+]
+UsagePurpose = Literal["rag.ingest", "rag.search"]
+"""Work Caliban did on the tenant's behalf: ``rag.ingest`` (embedding a collection's
+documents) or ``rag.search`` (a node's retrieval query, its embedding and reranking)."""
 ProblemKind = Literal[
     "spec",
     "tool",
@@ -210,6 +222,31 @@ class _Request(BaseModel):
         return self.model_dump(mode="json", exclude_none=True)
 
 
+PiiLabel = Annotated[str, Field(pattern=r"^[A-Za-z0-9_]{1,40}$")]
+
+
+class PiiPattern(_Request):
+    """One of the tenant's own L0 PII patterns (``components.schemas.PiiPattern``)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    label: PiiLabel
+    """``NATIONAL_ID``, ``PHONE``, ``EMAIL``, ``PERSON``, ``ORG``, ``LOCATION``, ``IBAN`` or
+    ``CARD`` use the built-in surrogates; other labels get shape-preserving ones."""
+    pattern: str = Field(max_length=500)
+    """Rust ``regex`` syntax (linear time: no backreferences or lookaround); must not match
+    the empty string."""
+
+
+class PiiTerm(_Request):
+    """One term of the tenant's PII dictionary: whole-word, case-insensitive."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    term: str = Field(min_length=2, max_length=200)
+    label: PiiLabel
+
+
 class Health(_Response):
     status: Literal["ok", "degraded"]
     version: str
@@ -226,6 +263,11 @@ class Tenant(_Response):
     """Surrogate consistency for reversible PII. ``None`` from older servers."""
     semantic_cache: SemanticCacheSetting | None = None
     """Whether the tenant may use the semantic cache. ``None`` from older servers."""
+    pii_on_sovereign: bool | None = None
+    """The PII mode also applies to sovereign and attested models. ``None`` from older
+    servers."""
+    pii_patterns: list[PiiPattern] | None = None
+    pii_dictionary: list[PiiTerm] | None = None
     auto_cache_hit_fraction: float | None = None
     """Share of the flat ``caliban/auto`` price billed for this tenant's cache hits, 0..1.
     ``None``: the deployment's ``[routing] auto_cache_hit_fraction`` (0.2 unless configured)
@@ -241,6 +283,9 @@ class TenantCreate(_Request):
     region: str | None = None
     pii_default: PiiMode | None = None
     pii_surrogate_scope: PiiSurrogateScope | None = None
+    pii_on_sovereign: bool | None = None
+    pii_patterns: list[PiiPattern] | None = Field(default=None, max_length=50)
+    pii_dictionary: list[PiiTerm] | None = Field(default=None, max_length=10000)
     semantic_cache: SemanticCacheSetting | None = None
     auto_cache_hit_fraction: float | None = Field(default=None, ge=0, le=1)
 
@@ -253,6 +298,11 @@ class TenantUpdate(_Request):
 
     pii_default: PiiMode | None = None
     pii_surrogate_scope: PiiSurrogateScope | None = None
+    pii_on_sovereign: bool | None = None
+    pii_patterns: list[PiiPattern] | None = Field(default=None, max_length=50)
+    """Replaced as a whole; ``[]`` clears them."""
+    pii_dictionary: list[PiiTerm] | None = Field(default=None, max_length=10000)
+    """Replaced as a whole; ``[]`` clears it. Audited as a count of terms, never the terms."""
     semantic_cache: SemanticCacheSetting | None = None
     auto_cache_hit_fraction: float | None = Field(default=None, ge=0, le=1)
 
@@ -715,6 +765,9 @@ class UsageEvent(_Response):
     saved_usd: float | None = None
     """Priced cache hits only: what the hit saved. ``caliban/auto``: ``flat_price_usd -
     billed_usd``; other models: the model cost the hit avoided."""
+    purpose: UsagePurpose | None = None
+    """Work Caliban did on the tenant's behalf (``rag.ingest``, ``rag.search``). ``None`` for
+    client calls and node model calls."""
 
 
 class UsageTotals(_Response):
@@ -744,9 +797,17 @@ class UsageTotals(_Response):
     """``billed_usd - routed_model_cost_usd``."""
 
 
+class UsageByPurpose(_Response):
+    purpose: str
+    totals: UsageTotals
+
+
 class UsageReport(_Response):
     events: list[UsageEvent]
     totals: UsageTotals
+    by_purpose: list[UsageByPurpose] | None = None
+    """The totals per ``purpose``, so retrieval spend is separable from the tenant's own
+    calls. ``None`` from older servers."""
 
 
 # ───────────────────────────── evals ─────────────────────────────
@@ -837,6 +898,10 @@ class InjectionBar(_Request):
     min_pass_rate: float = Field(ge=0, le=1)
     """Least share of attacks blocked (server default 1: every attack). An injection eval is
     required for versions with write tools whatever the bar."""
+    read_only: InjectionReadOnly | None = None
+    """Read-only versions (read tools that bring data in, no write tool): ``required``
+    (server default) gates them on an injection eval too; ``optional`` lets them promote
+    without one. A finished injection eval is checked against the bar either way."""
 
 
 class EvalPolicy(_Request):
@@ -855,7 +920,8 @@ class EvalPolicyView(_Response):
     node: str
     policy: EvalPolicy
     injection_bar: float
-    """The injection bar in effect for versions with write tools (default 1)."""
+    """The injection bar in effect for versions with write tools and read-only versions
+    (default 1)."""
     updated_at: datetime | None = None
     updated_by: str | None = None
 
@@ -1115,6 +1181,9 @@ class GateCheck(_Response):
     node: str | None = None
     version: int | None = None
     has_write_tools: bool | None = None
+    has_untrusted_reads: bool | None = None
+    """Read tools that bring data in (MCP, ``datasource_query``, ``rag_search``): the version
+    is gated on an injection eval unless the policy makes it optional."""
     allowed: bool
     evidence: GateEvidence | None = None
     """The evals that meet the bar; ``None`` when no gate applies."""

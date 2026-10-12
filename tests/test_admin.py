@@ -1249,3 +1249,121 @@ def test_eval_wait_times_out(admin: CalibanAdmin) -> None:
     router(admin).get("/tenants/t1/evals/ev_1").respond(200, json=EVAL)
     with pytest.raises(CalibanError, match="still pending"):
         admin.evals.wait("t1", "ev_1", poll_s=0.01, timeout_s=0)
+
+
+def test_tenant_pii_patterns_dictionary_and_sovereign(admin: CalibanAdmin) -> None:
+    patterns = [{"label": "MRN", "pattern": "MRN-[0-9]{6}"}]
+    dictionary = [{"term": "Project Lumen", "label": "ORG"}]
+    r = router(admin)
+    patch = r.patch("/tenants/t1").respond(
+        200,
+        json={
+            **TENANT,
+            "pii_on_sovereign": True,
+            "pii_patterns": patterns,
+            "pii_dictionary": dictionary,
+        },
+    )
+    create = r.post("/tenants").respond(201, json=TENANT)
+
+    t = admin.tenants.update(
+        "t1",
+        pii_on_sovereign=True,
+        pii_patterns=[m.PiiPattern(label="MRN", pattern="MRN-[0-9]{6}")],
+        pii_dictionary=dictionary,
+    )
+    assert json.loads(patch.calls.last.request.content) == {
+        "pii_on_sovereign": True,
+        "pii_patterns": patterns,
+        "pii_dictionary": dictionary,
+    }
+    assert t.pii_on_sovereign is True
+    assert t.pii_patterns == [m.PiiPattern(label="MRN", pattern="MRN-[0-9]{6}")]
+    assert t.pii_dictionary is not None and t.pii_dictionary[0].term == "Project Lumen"
+
+    # Lists are replaced as a whole: [] is sent and clears them; None leaves them alone.
+    admin.tenants.update("t1", pii_patterns=[], pii_dictionary=[])
+    assert json.loads(patch.calls.last.request.content) == {
+        "pii_patterns": [],
+        "pii_dictionary": [],
+    }
+    admin.tenants.create(name="Acme", pii_on_sovereign=False, pii_dictionary=dictionary)
+    assert json.loads(create.calls.last.request.content) == {
+        "name": "Acme",
+        "pii_on_sovereign": False,
+        "pii_dictionary": dictionary,
+    }
+    # Older servers omit the fields.
+    assert m.Tenant.model_validate(TENANT).pii_patterns is None
+    calls = patch.call_count
+    with pytest.raises(ValueError, match="label"):
+        admin.tenants.update("t1", pii_patterns=[{"label": "bad label", "pattern": "x"}])
+    with pytest.raises(ValueError, match="term"):
+        admin.tenants.update("t1", pii_dictionary=[{"term": "x", "label": "ORG"}])
+    with pytest.raises(ValueError, match="pii_patterns"):
+        admin.tenants.update("t1", pii_patterns=patterns * 51)
+    assert patch.call_count == calls
+
+
+def test_usage_by_purpose(admin: CalibanAdmin) -> None:
+    rag_event = {**USAGE_BASE, "model": "local/bge-m3", "purpose": "rag.search"}
+    router(admin).get("/usage").respond(
+        200,
+        json={
+            "events": [USAGE_BASE, rag_event],
+            "by_purpose": [
+                {"purpose": "rag.ingest", "totals": {"requests": 3, "cost_usd": 0.0015}},
+                {"purpose": "rag.search", "totals": {"requests": 1, "cost_usd": 0.0005}},
+            ],
+            "totals": USAGE_TOTALS,
+        },
+    )
+    rep = admin.usage.get(tenant_id="t1")
+    assert [e.purpose for e in rep.events] == [None, "rag.search"]
+    assert rep.by_purpose is not None
+    assert [(p.purpose, p.totals.requests) for p in rep.by_purpose] == [
+        ("rag.ingest", 3),
+        ("rag.search", 1),
+    ]
+
+
+def test_injection_bar_read_only_and_gate_untrusted_reads(admin: CalibanAdmin) -> None:
+    policy = {"injection": {"min_pass_rate": 1.0, "read_only": "optional"}}
+    view = {"object": "node.eval_policy", "node": "desk", "policy": policy, "injection_bar": 1.0}
+    r = router(admin)
+    put = r.put("/tenants/t1/nodes/desk/eval-policy").respond(200, json=view)
+    r.get("/tenants/t1/nodes/desk/versions/4/gate").respond(
+        200,
+        json={
+            "node": "desk",
+            "version": 4,
+            "has_write_tools": False,
+            "has_untrusted_reads": True,
+            "allowed": True,
+            "evidence": None,
+            "problems": [],
+        },
+    )
+    out = admin.evals.set_policy(
+        "t1", "desk", injection=m.InjectionBar(min_pass_rate=1.0, read_only="optional")
+    )
+    assert json.loads(put.calls.last.request.content) == policy
+    assert out.policy.injection is not None and out.policy.injection.read_only == "optional"
+    gate = admin.evals.gate("t1", "desk", 4)
+    assert (gate.has_write_tools, gate.has_untrusted_reads, gate.allowed) == (False, True, True)
+    with pytest.raises(ValueError, match="read_only"):
+        m.InjectionBar(min_pass_rate=1.0, read_only="never")  # type: ignore[arg-type]
+
+
+def test_injection_verdict_answer_integrity() -> None:
+    v = m.InjectionVerdict.model_validate(
+        {
+            "case": "answer.phone",
+            "category": "answer_integrity",
+            "succeeded": False,
+            "attacked": True,
+            "defenses": ["answer_guard"],
+            "tool_calls": 1,
+        }
+    )
+    assert (v.category, v.defenses) == ("answer_integrity", ["answer_guard"])

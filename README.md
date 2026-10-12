@@ -73,6 +73,7 @@ Every data-plane request body can carry a `caliban` object. Clients that do not 
 | Field | Values | Meaning |
 |---|---|---|
 | `pii` | `off`, `mask`, `reversible` | How PII is handled before text leaves your trust boundary. `mask` replaces entities with placeholders such as `[EMAIL]`; `reversible` pseudonymises them and restores the originals in the response. |
+| `pii_floor` | `off`, `mask`, `reversible` | A minimum protection applied to every model class, sovereign and attested models included. It only strengthens: the request gets the stricter of this and `pii` (or the tenant's mode), ordered `off` < `reversible` < `mask`. A node's `guardrails.pii` sets it on the node's calls. |
 | `cache` | `off`, `exact`, `semantic` | Response cache mode. `off`: no cache. `exact`: exact cache only. `semantic`: exact, then the semantic cache if the tenant has it on, whatever the temperature. Unset: exact, plus semantic up to the gateway's temperature limit if the tenant has it on (see [Tenant settings](#tenant-settings)). |
 | `datasources` | `list[str]` | Datasources (by name) the request may query through the ontology layer. |
 | `node` | `str` | Reserved: core parses it but does not act on it. To run a node, use `model="node/<name>"` (see [Nodes](#nodes)). |
@@ -294,6 +295,9 @@ The constructor takes `token`, `base_url`, `timeout` (default 30 s), `max_retrie
 |---|---|---|---|
 | `pii_default` | `"off"`, `"mask"`, `"reversible"` | `"reversible"` | PII mode for requests that do not set `caliban.pii`. |
 | `pii_surrogate_scope` | `"tenant"`, `"session"` | `"tenant"` | How reversible PII surrogates are chosen. |
+| `pii_on_sovereign` | `bool` | `False` | Also apply the tenant's PII mode to models inside the trust boundary (`t0_sovereign`, `t1_attested`). Off, those models receive the text as is. External models always get the mode, and `caliban.pii_floor` (a node's `guardrails.pii`) applies to every model class. |
+| `pii_patterns` | list of `PiiPattern` or mappings (at most 50) | `[]` | The tenant's own L0 detection patterns: `{label, pattern}`. `NATIONAL_ID`, `PHONE`, `EMAIL`, `PERSON`, `ORG`, `LOCATION`, `IBAN` and `CARD` use the built-in surrogates; other labels get shape-preserving ones. `pattern` uses the Rust `regex` syntax (linear time: no backreferences or lookaround) and must not match the empty string. Replaced as a whole; `[]` clears them. |
+| `pii_dictionary` | list of `PiiTerm` or mappings (at most 10 000) | `[]` | Whole-word, case-insensitive terms to protect: `{term, label}` (customer names, internal codes). Replaced as a whole; `[]` clears it. Audited as a count of terms, never the terms. |
 | `semantic_cache` | `"off"`, `"on"` | `"off"` | Whether the tenant's eligible requests may use the semantic cache. |
 | `auto_cache_hit_fraction` | `0` to `1`, or `"default"` | deployment value | Share of the flat `caliban/auto` price billed for the tenant's cache hits. `"default"` clears the override, so the deployment's `[routing] auto_cache_hit_fraction` (0.2 unless configured) applies. |
 
@@ -305,10 +309,11 @@ print(t.pii_surrogate_scope, t.semantic_cache)  # session on
 
 - **`pii_surrogate_scope="tenant"`** (the default): a given value always gets the same surrogate within the tenant (a keyed HMAC per tenant, derived from `CALIBAN_KEK`). That lets pseudonymised requests hit the exact cache. The trade-off is linkability: anyone who can see the pseudonymised traffic (an upstream provider, for example) can tell that two requests or sessions of the tenant mention the same person, even without learning who it is. Surrogates never cross tenants.
 - **`pii_surrogate_scope="session"`**: every request gets fresh surrogates, so requests cannot be linked through them. Requests that carry PII then bypass the exact and semantic caches.
+- **`pii_patterns` and `pii_dictionary`** are the deterministic first tier of PII detection, compiled per tenant (see [research note 05](https://github.com/thecalibanproject/docs/blob/main/research/05-anonymization-and-privacy.md)): `admin.tenants.update(t.id, pii_patterns=[{"label": "MRN", "pattern": "MRN-[0-9]{6}"}], pii_dictionary=[{"term": "Project Lumen", "label": "ORG"}])`. Labels are checked (`[A-Za-z0-9_]{1,40}`) before sending; the regex is checked by the server.
 - **`auto_cache_hit_fraction`**: a cache hit (exact or semantic) calls no model, so a `caliban/auto` request answered from cache is billed this share of the flat price. Values outside 0 to 1 raise `ValueError` before any request. On `Tenant`, `None` means the deployment value applies.
 - **`semantic_cache="on"`**: an eligible request may be answered with the response to an earlier, semantically similar request of the same tenant (same model, system prompt, history and parameters). Entries never cross tenants. The deployment must also enable it (`[cache.semantic] enabled`). Hits report `x-caliban-cache: hit` with `x-caliban-cache-tier: semantic`.
 
-Both fields are `None` on tenants from an older server.
+These fields are `None` on tenants from an older server.
 
 #### Usage fields
 
@@ -325,6 +330,9 @@ Both fields are `None` on tenants from an older server.
 | `flat_price_usd` | `caliban/auto` | The full flat auto price for the same tokens. On a cache hit, the flat price of the cached answer's tokens (what a miss would have billed). |
 | `billed_usd` | `caliban/auto` | What the customer is billed: `flat_price_usd` on a miss, `flat_price_usd` times the tenant's cache-hit fraction on a hit. |
 | `saved_usd` | Priced cache hits | What the hit saved: `flat_price_usd - billed_usd` for `caliban/auto`, the avoided model cost for other models. |
+| `purpose` | Work Caliban did for the tenant | `"rag.ingest"` (embedding a collection's documents) or `"rag.search"` (a node's retrieval query, its embedding and reranking). `None` on client calls and node model calls. |
+
+`by_purpose` gives the same totals per `purpose` (`UsageByPurpose`), so retrieval spend is separable from the tenant's own calls; it is `None` from an older server.
 
 `totals` adds `semantic_cache_hits` (`cache_hits` counts both tiers), `saved_usd` (what cache hits saved, all models), `auto_requests` (requests for `caliban/auto`) and `auto_cache_hits`, and, summed over the `caliban/auto` events that carry both prices, `flat_price_usd`, `billed_usd`, `auto_saved_usd`, `routed_model_cost_usd` and `margin_usd` (`billed_usd - routed_model_cost_usd`).
 
@@ -617,6 +625,7 @@ print(gate.allowed, gate.evidence, [p.message for p in gate.problems])
 - `gate` returns typed `evidence` (with each pinned subnode's own evidence under `subnodes`) and `problems`; a problem's `path` names a subnode whose own gate failed.
 - `get_golden_set` returns the cases only to a caller with `runs.data` (`content_visible`); `evals.get` returns the trials, with their `detail` under the same permission.
 - `set_policy` replaces the whole bar: leaving `golden` out removes the golden gate, and an injection eval stays required for versions with write tools whatever `injection` says.
+- A read-only version (read tools that bring data in: MCP, `builtin://datasource_query`, `builtin://rag_search`; no write tool) needs an injection eval too by default, because what it reads can steer its answer (the suite's `answer_integrity` cases, which the `answer_guard` defense blocks). `injection={"min_pass_rate": 1.0, "read_only": "optional"}` lets such versions promote without one; a finished injection eval is still checked against the bar. `gate` reports `has_untrusted_reads` next to `has_write_tools`.
 - `list` pages with `cursor`/`next_cursor`; `status` takes one status or a list.
 
 ## Streaming

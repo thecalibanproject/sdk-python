@@ -76,6 +76,11 @@ class CalibanOptions(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     pii: PiiMode | None = None
+    pii_floor: PiiMode | None = None
+    """A minimum PII protection applied to every model class, sovereign and attested models
+    included. Only strengthens: the request gets the stricter of this and ``pii`` (or the
+    tenant's mode), ordered ``off`` < ``reversible`` < ``mask``. A node's ``guardrails.pii``
+    sets it on the node's calls."""
     cache: CacheMode | None = None
     datasources: list[str] | None = None
     node: str | None = None

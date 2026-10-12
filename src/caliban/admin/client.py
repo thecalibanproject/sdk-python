@@ -64,7 +64,9 @@ from .models import (
     OntologyReview,
     OntologyReviewResult,
     PiiMode,
+    PiiPattern,
     PiiSurrogateScope,
+    PiiTerm,
     ProviderHealth,
     ProviderKey,
     ProviderKeyCreate,
@@ -175,18 +177,27 @@ class Tenants(_Resource):
         region: str | None = None,
         pii_default: PiiMode | None = None,
         pii_surrogate_scope: PiiSurrogateScope | None = None,
+        pii_on_sovereign: bool | None = None,
+        pii_patterns: Sequence[PiiPattern | Mapping[str, Any]] | None = None,
+        pii_dictionary: Sequence[PiiTerm | Mapping[str, Any]] | None = None,
         semantic_cache: SemanticCacheSetting | None = None,
         auto_cache_hit_fraction: float | None = None,
     ) -> Tenant:
         """Create a tenant. ``auto_cache_hit_fraction`` (0..1) overrides the share of the flat
-        ``caliban/auto`` price billed for its cache hits; omit it for the deployment value."""
-        body = TenantCreate(
-            name=name,
-            region=region,
-            pii_default=pii_default,
-            pii_surrogate_scope=pii_surrogate_scope,
-            semantic_cache=semantic_cache,
-            auto_cache_hit_fraction=auto_cache_hit_fraction,
+        ``caliban/auto`` price billed for its cache hits; omit it for the deployment value.
+        The PII arguments are those of :meth:`update`."""
+        body = TenantCreate.model_validate(
+            {
+                "name": name,
+                "region": region,
+                "pii_default": pii_default,
+                "pii_surrogate_scope": pii_surrogate_scope,
+                "pii_on_sovereign": pii_on_sovereign,
+                "pii_patterns": _pii_list(pii_patterns),
+                "pii_dictionary": _pii_list(pii_dictionary),
+                "semantic_cache": semantic_cache,
+                "auto_cache_hit_fraction": auto_cache_hit_fraction,
+            }
         ).to_body()
         return self._one(Tenant, self._post("tenants", body))
 
@@ -196,6 +207,9 @@ class Tenants(_Resource):
         *,
         pii_default: PiiMode | None = None,
         pii_surrogate_scope: PiiSurrogateScope | None = None,
+        pii_on_sovereign: bool | None = None,
+        pii_patterns: Sequence[PiiPattern | Mapping[str, Any]] | None = None,
+        pii_dictionary: Sequence[PiiTerm | Mapping[str, Any]] | None = None,
         semantic_cache: SemanticCacheSetting | None = None,
         auto_cache_hit_fraction: float | Literal["default"] | None = None,
     ) -> Tenant:
@@ -205,6 +219,11 @@ class Tenants(_Resource):
         ``pii_surrogate_scope="session"`` gives every request fresh PII surrogates (requests
         cannot be linked through them, and requests carrying PII bypass the caches);
         ``"tenant"`` (the default) keeps one surrogate per value within the tenant.
+        ``pii_on_sovereign=True`` applies the PII mode to sovereign and attested models too
+        (off by default: they receive the text as is). ``pii_patterns`` (at most 50
+        ``{label, pattern}``, Rust regex syntax) and ``pii_dictionary`` (at most 10 000
+        whole-word ``{term, label}``) are the tenant's own detection rules, each replaced as a
+        whole; ``[]`` clears them.
         ``semantic_cache="on"`` lets eligible requests use the semantic cache (the deployment
         must enable it too). ``auto_cache_hit_fraction`` (0..1) is the share of the flat
         ``caliban/auto`` price billed when a cache tier answers (no model is called);
@@ -214,15 +233,27 @@ class Tenants(_Resource):
         """
         clear = auto_cache_hit_fraction == "default"
         fraction = None if isinstance(auto_cache_hit_fraction, str) else auto_cache_hit_fraction
-        body = TenantUpdate(
-            pii_default=pii_default,
-            pii_surrogate_scope=pii_surrogate_scope,
-            semantic_cache=semantic_cache,
-            auto_cache_hit_fraction=fraction,
+        body = TenantUpdate.model_validate(
+            {
+                "pii_default": pii_default,
+                "pii_surrogate_scope": pii_surrogate_scope,
+                "pii_on_sovereign": pii_on_sovereign,
+                "pii_patterns": _pii_list(pii_patterns),
+                "pii_dictionary": _pii_list(pii_dictionary),
+                "semantic_cache": semantic_cache,
+                "auto_cache_hit_fraction": fraction,
+            }
         ).to_body()
         if clear:
             body["auto_cache_hit_fraction"] = None
         return self._one(Tenant, self._patch(f"tenants/{_p(tenant_id)}", body))
+
+
+def _pii_list(items: Sequence[BaseModel | Mapping[str, Any]] | None) -> list[Any] | None:
+    # An empty list is sent (it clears the server's list); None leaves it unchanged.
+    if items is None:
+        return None
+    return [i.model_dump() if isinstance(i, BaseModel) else dict(i) for i in items]
 
 
 class ApiKeys(_Resource):

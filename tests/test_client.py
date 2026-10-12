@@ -540,3 +540,24 @@ def test_caliban_untrusted_option() -> None:
         CalibanOptions(untrusted=["email"])  # a JSON pointer starts with '/'
     with pytest.raises(ValidationError):
         CalibanOptions(untrusted=[f"/f{i}" for i in range(65)])
+
+
+def test_caliban_pii_floor_option() -> None:
+    from pydantic import ValidationError
+
+    from caliban import CalibanOptions
+
+    seen: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, json=completion_body())
+
+    make_client(handler).chat.completions.create(
+        model="local/qwen3-8b",
+        messages=[{"role": "user", "content": "hi"}],
+        caliban=CalibanOptions(pii="reversible", pii_floor="mask"),
+    )
+    assert seen[-1]["caliban"] == {"pii": "reversible", "pii_floor": "mask"}
+    with pytest.raises(ValidationError):
+        CalibanOptions(pii_floor="strict")  # type: ignore[arg-type]
