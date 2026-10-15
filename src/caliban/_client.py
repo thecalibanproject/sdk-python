@@ -17,6 +17,7 @@ from ._base import (
     TimeoutTypes,
     parse_response,
 )
+from ._runs import AsyncRuns, Runs
 from ._streaming import AsyncChatCompletionStream, ChatCompletionStream
 from .errors import CalibanError
 from .types import (
@@ -404,6 +405,7 @@ class Caliban:
         self.models = Models(self._http)
         self.embeddings = Embeddings(self._http)
         self.rerank = Rerank(self._http)
+        self.runs = Runs(self._http)
 
     @property
     def base_url(self) -> str:
@@ -631,6 +633,7 @@ class AsyncCaliban:
         self.models = AsyncModels(self._http)
         self.embeddings = AsyncEmbeddings(self._http)
         self.rerank = AsyncRerank(self._http)
+        self.runs = AsyncRuns(self._http)
 
     @property
     def base_url(self) -> str:

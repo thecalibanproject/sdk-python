@@ -191,6 +191,9 @@ Caliban(
 | `embeddings.create(...)` | `POST /v1/embeddings` | `CreateEmbeddingResponse` |
 | `rerank.create(...)` | `POST /v1/rerank` | `RerankResponse` |
 | `models.list()` | `GET /v1/models` | `ModelList` |
+| `runs.create(node, ...)` | `POST /v1/nodes/{node}/runs` | `NodeRun` |
+| `runs.get(run_id)`, `runs.input(run_id, answer)`, `runs.cancel(run_id)` | `GET /v1/runs/{id}`, `POST .../input`, `POST .../cancel` | `NodeRun` |
+| `runs.list(...)` | `GET /v1/runs` | `NodeRunList` |
 
 `chat.completions.create` takes `model`, `messages`, `stream`, `caliban`, `temperature`, `max_tokens` and `tools`. Any other keyword argument (`top_p`, `response_format`, `seed`, ...) is passed through in the body. Every method also accepts `timeout=`, and the `create` methods accept `extra_body=` and `extra_headers=`.
 
@@ -227,6 +230,26 @@ for r in res.results:  # best first
 ```
 
 `results` keep the server's order (highest `relevance_score` first) and `index` points into `documents`. The SDK raises `CalibanError` before sending for a non-string query, an empty or non-string `documents` list, or an invalid `top_n`. Text sent outside the trust boundary is PII-masked; returned documents are always your originals.
+
+**Node runs.** Run a published node (an agent or a workflow) with structured input, follow it, and answer its human steps. The API key must be allowed to run the node.
+
+```python
+run = client.runs.create(
+    "invoice-triage",
+    input={"email": {"from": "ap@acme.test", "body": email_text}},
+    untrusted=["/email/body"],  # caller data: carries the `caller` taint label
+    idempotency_key="email-8812",  # a retry returns the run the first request created
+)
+while run.status == "input_required" and run.awaiting:
+    print(run.awaiting.question)
+    run = client.runs.input(run.id, {"approve": True}, step=run.awaiting.step)
+    run = client.runs.wait(run.id, timeout_s=120)  # until it ends or asks again
+print(run.status, run.output, run.cost_usd)
+for step in run.steps:  # the run's timeline
+    print(step.started_at, step.id, step.status, step.duration_ms, step.usd)
+```
+
+`create` is sync by default: it returns when the run ends or waits for a human, or after the server's wait (`wait_s`) with the run so far, so check `status` (or `run.done`). `async_=True` returns the pending run at once. Pass exactly one of `input` (checked against the node's input schema) and chat `messages`; `version` pins a published version (default: the live one) and `budget` can only lower the version's. Without `idempotency_key` a `create` is not retried on 502. `runs.list(node=, version=, status=, created_after=, created_before=, limit=, cursor=)` returns summaries, newest first. Streaming a run's events (`stream: true`, `GET /v1/runs/{id}/events`) is not wrapped yet; `runs.wait` polls instead.
 
 The async client has the same methods:
 
