@@ -240,6 +240,67 @@ class AnswerCheck(BaseModel):
     """``passed``, ``redacted`` or ``refused``."""
 
 
+class ServerTimingEntry(BaseModel):
+    """One ``Server-Timing`` metric: ``name``, ``dur`` in milliseconds (``None`` on ``node``
+    for streams) and ``desc`` (``route``: the deciding stage; ``cache``: ``hit`` or ``miss``;
+    ``node``: the run id)."""
+
+    name: str
+    dur: float | None = None
+    desc: str | None = None
+
+    @classmethod
+    def parse(cls, value: str | None) -> list[ServerTimingEntry] | None:
+        """Parse a ``Server-Timing`` value (``auth;dur=0.210, route;dur=4.8;desc="knn"``)
+        into its metrics, in order. Nameless entries are skipped and a ``dur`` that is not a
+        non-negative number is left out. ``None`` when absent or empty. Never raises."""
+        out: list[ServerTimingEntry] = []
+        for metric in _split_outside_quotes(value or "", ","):
+            head, *params = _split_outside_quotes(metric, ";")
+            name = head.strip()
+            if not name or "=" in name:
+                continue
+            dur: float | None = None
+            desc: str | None = None
+            for param in params:
+                key, eq, raw = param.partition("=")
+                key = key.strip().lower()
+                if not eq or not key:
+                    continue
+                v = raw.strip()
+                if len(v) >= 2 and v[0] == v[-1] == '"':
+                    v = re.sub(r"\\(.)", r"\1", v[1:-1])
+                if key == "dur" and dur is None:
+                    dur = _to_float(v) if v else None
+                elif key == "desc" and desc is None:
+                    desc = v
+            out.append(cls(name=name, dur=dur, desc=desc))
+        return out or None
+
+
+def _split_outside_quotes(value: str, sep: str) -> list[str]:
+    parts: list[str] = []
+    cur: list[str] = []
+    quoted = False
+    i = 0
+    while i < len(value):
+        c = value[i]
+        if quoted and c == "\\" and i + 1 < len(value):
+            cur.append(value[i : i + 2])
+            i += 2
+            continue
+        if c == '"':
+            quoted = not quoted
+        if c == sep and not quoted:
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(c)
+        i += 1
+    parts.append("".join(cur))
+    return parts
+
+
 class CalibanResponseMeta(BaseModel):
     """Metadata Caliban returns in ``x-caliban-*`` response headers."""
 
@@ -273,6 +334,10 @@ class CalibanResponseMeta(BaseModel):
     """``Caliban-Run-Id``: the node run that answered."""
     run_status: str | None = None
     """``x-caliban-run-status``: the status of that run."""
+    server_timing: list[ServerTimingEntry] | None = None
+    """``Server-Timing``, parsed: the gateway's per-stage durations in pipeline order
+    (``auth``, ``route``, ``embed``, ``pii``, ``cache``, ``upstream``, ``upstream_total``,
+    ``node``, ``total``). ``None`` when absent (``[telemetry] server_timing = false``)."""
     headers: dict[str, str] = Field(default_factory=dict)
     """All ``x-caliban-*`` headers, lower-cased, verbatim."""
 
@@ -281,6 +346,7 @@ class CalibanResponseMeta(BaseModel):
         """Parse any response's headers, for example a raw ``/v1/messages`` response."""
         cal = {k.lower(): v for k, v in headers.items() if k.lower().startswith("x-caliban-")}
         run_id = next((v for k, v in headers.items() if k.lower() == "caliban-run-id"), None)
+        timing = next((v for k, v in headers.items() if k.lower() == "server-timing"), None)
         return cls(
             request_id=cal.get("x-caliban-request-id"),
             routed_model=cal.get("x-caliban-routed-model"),
@@ -294,6 +360,7 @@ class CalibanResponseMeta(BaseModel):
             route_fallback=_text(cal.get("x-caliban-route-fallback")),
             run_id=_text(run_id),
             run_status=_text(cal.get("x-caliban-run-status")),
+            server_timing=ServerTimingEntry.parse(timing),
             headers=cal,
         )
 

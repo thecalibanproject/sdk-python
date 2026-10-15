@@ -123,6 +123,7 @@ The gateway reports what it did in `x-caliban-*` response headers. Completions, 
 | `x-caliban-route-fallback` | `route_fallback` | Why `caliban/auto` answered with a model rather than a node (`low_confidence`, `no_node_for_intent`, ...). |
 | `Caliban-Run-Id` | `run_id` | The node run that answered. |
 | `x-caliban-run-status` | `run_status` | Its status, for example `succeeded` or `input_required`. |
+| `Server-Timing` | `server_timing` | The gateway's per-stage durations in ms, in pipeline order: a list of `ServerTimingEntry` (`name`, `dur`, `desc`) for `auth`, `route` (`desc`: the deciding stage), `embed`, `pii`, `cache` (`desc`: `hit` or `miss`), `upstream`, `upstream_total`, `node` (`desc`: the run id) and `total`. `None` when the gateway has it off (`[telemetry] server_timing = false`). `ServerTimingEntry.parse(value)` works on a raw header. |
 
 A node answer (`model="node/<name>"`, or `caliban/auto` handing the request to a node) carries the headers of every chat response: `request_id`, `routed_model` (`node/<name>@v<N>`), `cache="bypass"`, and on non-streaming answers `pii_entities` (the entities protected across the run's model calls), `cost_usd` and `billed_usd`.
 

@@ -58,6 +58,7 @@ from .types import (
     RerankDocument,
     RerankResponse,
     RerankResult,
+    ServerTimingEntry,
 )
 
 __all__ = [
@@ -103,6 +104,7 @@ __all__ = [
     "RerankResult",
     "SSEDecoder",
     "ServerSentEvent",
+    "ServerTimingEntry",
     "ServiceUnavailableError",
     "StreamError",
     "StreamText",
