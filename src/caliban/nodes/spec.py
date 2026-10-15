@@ -104,6 +104,10 @@ class ToolRef(_Open):
     """Writes, and reads that reach the network through their arguments: taint labels the
     arguments may carry without a human approval (``tool:<server>/*``, ``datasource``,
     ``caller``, ``*``)."""
+    eval_live: StrictBool | None = None
+    """Golden eval trials answer every ``mcp://`` tool from the eval sandbox; ``True`` lets
+    trials call this tool for real. Only ``mcp://`` tools with effect ``read`` (core refuses
+    anything else when the version is created); built-in tools always run live."""
 
 
 class DatasourceScopes(_Open):
@@ -404,6 +408,11 @@ def lint(spec: NodeSpec) -> list[str]:
             warnings.append(
                 f"tools[{i}].allow_tainted: only applies to writes and to MCP reads that reach "
                 "the network"
+            )
+        if tool.eval_live and (tool.effect != "read" or not tool.ref.startswith("mcp://")):
+            warnings.append(
+                f"tools[{i}].eval_live: only mcp:// tools with effect read may run live in "
+                "golden trials (refused at version creation)"
             )
     for i, vertex in enumerate(spec.graph.vertices or [] if spec.graph else []):
         if vertex.type == "code":

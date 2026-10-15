@@ -307,6 +307,31 @@ def test_lint_builtin_tools_and_taint() -> None:
     ]
 
 
+def test_eval_live_only_on_mcp_reads() -> None:
+    spec = validate(
+        {
+            **MINIMAL,
+            "tools": [
+                {"ref": "mcp://crm/lookup#sha256:ab", "effect": "read", "eval_live": True},
+                {"ref": "mcp://crm/refund#sha256:cd", "effect": "write", "eval_live": True},
+                {"ref": "builtin://rag_search", "effect": "read", "eval_live": True},
+            ],
+            "datasources": {"scopes": ["rag.policies:read"]},
+            "guardrails": {"injection_mode": "camel"},
+        }
+    )
+    assert spec.tools is not None and spec.tools[0].eval_live is True
+    assert lint(spec) == [
+        "tools[1].eval_live: only mcp:// tools with effect read may run live in golden "
+        "trials (refused at version creation)",
+        "tools[2].eval_live: only mcp:// tools with effect read may run live in golden "
+        "trials (refused at version creation)",
+    ]
+    assert issues_of(
+        {**MINIMAL, "tools": [{"ref": "mcp://a/b", "effect": "read", "eval_live": "yes"}]}
+    )
+
+
 def test_input_schema_untrusted_marks_and_caller_label() -> None:
     spec = validate(
         {
