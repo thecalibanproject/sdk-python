@@ -14,13 +14,30 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ..errors import CalibanError
 from ..evals.dataset import Case
-from ..types import CacheTier, ModelCapabilities, ModelKind, RouteStage, TrustTier
+from ..types import (
+    AnswerCheck,
+    CacheTier,
+    MastLabel,
+    ModelCapabilities,
+    ModelKind,
+    NodeRun,
+    NodeRunList,
+    NodeRunSummary,
+    RouteStage,
+    RunStatus,
+    RunStep,
+    TrustTier,
+)
 
 __all__ = [
+    "AnswerCheck",
     "ApiKeyCreate",
     "ApiKeyCreated",
     "ApiKeyInfo",
+    "ApiKeyUpdate",
     "CacheTier",
+    "CapturedGoldenCase",
+    "ConsoleRun",
     "Datasource",
     "DatasourceCreate",
     "DatasourceKind",
@@ -41,6 +58,7 @@ __all__ = [
     "GateEvidence",
     "GoldenBar",
     "GoldenCase",
+    "GoldenCaseCapture",
     "GoldenCaseSummary",
     "GoldenEvidence",
     "GoldenSet",
@@ -48,6 +66,9 @@ __all__ = [
     "GoldenSummary",
     "GoldenVerdict",
     "Health",
+    "Inbox",
+    "InboxApproval",
+    "InboxItem",
     "InjectionBar",
     "InjectionCaseResult",
     "InjectionCategory",
@@ -64,13 +85,31 @@ __all__ = [
     "IntrospectionStatus",
     "JudgeInfo",
     "LatencyPercentiles",
+    "MastLabel",
     "Model",
     "ModelCapabilities",
     "ModelCreate",
     "ModelDiscovery",
     "ModelKind",
     "Node",
+    "NodeCaps",
     "NodeCreate",
+    "NodeDiff",
+    "NodeDiffChange",
+    "NodeDiffSide",
+    "NodeLatest",
+    "NodePromotion",
+    "NodeRoute",
+    "NodeRun",
+    "NodeRunList",
+    "NodeRunSummary",
+    "NodeSpend",
+    "NodeSpendAmounts",
+    "NodeSpendCaps",
+    "NodeState",
+    "NodeSummary",
+    "NodeVersions",
+    "NodeWarning",
     "NotApplicable",
     "Ontology",
     "OntologyBatchReview",
@@ -110,6 +149,7 @@ __all__ = [
     "RagTrust",
     "RouteStage",
     "RunStatus",
+    "RunStep",
     "SemanticCacheSetting",
     "SharedProvider",
     "SharedProviderCreate",
@@ -122,10 +162,13 @@ __all__ = [
     "TenantUpdate",
     "TrialError",
     "TrustTier",
+    "UsageByNode",
     "UsageByPurpose",
+    "UsageByRoute",
     "UsageEvent",
     "UsagePurpose",
     "UsageReport",
+    "UsageTimings",
     "UsageTotals",
     "VerdictCheck",
 ]
@@ -178,16 +221,6 @@ EvalSuite = Literal["golden", "injection"]
 InjectionReadOnly = Literal["required", "optional"]
 EvalStatus = Literal["pending", "running", "succeeded", "failed", "cancelled"]
 EvalTrialStatus = Literal["running", "passed", "failed", "error"]
-RunStatus = Literal[
-    "pending",
-    "running",
-    "sleeping",
-    "input_required",
-    "succeeded",
-    "failed",
-    "budget_exhausted",
-    "cancelled",
-]
 InjectionCategoryName = Literal[
     "tainted_write",
     "exfiltration",
@@ -262,6 +295,33 @@ class Health(_Response):
     version: str
     mode: Literal["router", "control-plane", "standalone"]
     config_version: str | None = None
+    store: Literal["memory", "postgres"] | None = None
+    """Control plane only: the active store backend."""
+
+
+class NodeCaps(_Request):
+    """Caps every node version's budgets must fit (``components.schemas.NodeCaps``)."""
+
+    steps: int = Field(ge=1)
+    tokens: int = Field(ge=1)
+    wall_clock_s: int = Field(ge=1)
+    depth: int = Field(ge=1)
+    fanout: int = Field(ge=1)
+    usd: float | None = Field(default=None, gt=0)
+    """When set, every version must declare ``budgets.usd`` within it."""
+
+
+class NodeSpendCaps(_Request):
+    """Caps on what the tenant's node runs spend on model calls, per UTC day and month
+    (``components.schemas.NodeSpendCaps``). A cap reached ends runs as
+    ``budget_exhausted``."""
+
+    daily_usd: float | None = Field(default=None, ge=0)
+    monthly_usd: float | None = Field(default=None, ge=0)
+
+
+NodeRoute = Annotated[str, Field(pattern=r"^node/[a-z0-9_-]+(@(v[1-9][0-9]*|published))?$")]
+"""``node/<name>`` (the live version), ``node/<name>@published`` or ``node/<name>@v<N>``."""
 
 
 class Tenant(_Response):
@@ -292,10 +352,24 @@ class Tenant(_Response):
     """Share of the flat ``caliban/auto`` price billed for this tenant's cache hits, 0..1.
     ``None``: the deployment's ``[routing] auto_cache_hit_fraction`` (0.2 unless configured)
     applies, or an older server."""
+    node_caps: NodeCaps | None = None
+    """Caps on the budgets of published node versions; ``None``: the defaults (steps 200,
+    tokens 2 000 000, wall_clock_s 3600, depth 5, fanout 32)."""
+    node_spend_caps: NodeSpendCaps | None = None
+    """Daily and monthly caps on node spend; ``None``: none."""
+    node_routes: dict[str, str] | None = None
+    """Intents ``caliban/auto`` hands to the tenant's nodes: intent id to ``node/<name>``,
+    ``node/<name>@published`` or ``node/<name>@v<N>``."""
     created_at: datetime
     status: TenantStatus | None = None
     """``"deleted"`` only appears with ``include_deleted=True``. ``None`` from older servers."""
     deleted_at: datetime | None = None
+
+    @field_validator("node_caps", "node_spend_caps", mode="before")
+    @classmethod
+    def _drop_unknown_cap_keys(cls, v: Any, info: Any) -> Any:
+        model = NodeCaps if info.field_name == "node_caps" else NodeSpendCaps
+        return _known_keys(model, v)
 
 
 class TenantCreate(_Request):
@@ -308,6 +382,9 @@ class TenantCreate(_Request):
     pii_dictionary: list[PiiTerm] | None = Field(default=None, max_length=10000)
     semantic_cache: SemanticCacheSetting | None = None
     auto_cache_hit_fraction: float | None = Field(default=None, ge=0, le=1)
+    node_caps: NodeCaps | None = None
+    node_spend_caps: NodeSpendCaps | None = None
+    node_routes: dict[str, NodeRoute] | None = None
 
 
 class TenantUpdate(_Request):
@@ -325,6 +402,13 @@ class TenantUpdate(_Request):
     """Replaced as a whole; ``[]`` clears it. Audited as a count of terms, never the terms."""
     semantic_cache: SemanticCacheSetting | None = None
     auto_cache_hit_fraction: float | None = Field(default=None, ge=0, le=1)
+    node_caps: NodeCaps | None = None
+    """Clearing it (an explicit ``null``, the defaults) goes through
+    ``tenants.update(..., node_caps="default")``."""
+    node_spend_caps: NodeSpendCaps | None = None
+    """Removing them goes through ``tenants.update(..., node_spend_caps="none")``."""
+    node_routes: dict[str, NodeRoute] | None = None
+    """Replaced as a whole. Clearing it goes through ``tenants.update(..., node_routes="none")``."""
 
 
 class ApiKeyInfo(_Response):
@@ -334,6 +418,12 @@ class ApiKeyInfo(_Response):
     created_at: datetime
     revoked_at: datetime | None = None
     """Set once the key is revoked (listed only with ``include_revoked=True``)."""
+    nodes: list[str] | None = None
+    """Node allowlist. ``None``: every published node of the tenant; ``[]``: none."""
+    datasource_scopes: list[str] | None = None
+    """Datasource scopes the built-in query tool may read, and collections
+    (``rag.<collection>:read``) ``rag_search`` may search, for this key. ``None``: every scope
+    of the nodes it runs."""
     purpose: Literal["eval"] | None = None
     """``"eval"``: the tenant's eval key, managed by the control plane (it cannot be revoked
     through ``api_keys.revoke``; rotate it with ``evals.rotate_key``)."""
@@ -348,6 +438,14 @@ class ApiKeyCreate(_Request):
     name: str | None = None
 
 
+class ApiKeyUpdate(_Request):
+    """Body of ``PATCH .../api-keys/{keyId}``. Absent fields are kept; an explicit ``null``
+    lifts the restriction (see :meth:`caliban.admin.client.ApiKeys.update`)."""
+
+    nodes: list[str] | None = None
+    datasource_scopes: list[str] | None = None
+
+
 class ProviderKey(_Response):
     id: str
     tenant_id: str
@@ -356,6 +454,8 @@ class ProviderKey(_Response):
     base_url: str | None = None
     trust_tier: TrustTier
     last4: str | None = None
+    cache_salt: bool | None = None
+    """A per-tenant ``cache_salt`` is sent (vLLM prefix-cache isolation)."""
     created_at: datetime
 
 
@@ -367,6 +467,9 @@ class ProviderKeyCreate(_Request):
     """Provider id referenced by the model catalogue; defaults to the slugified label."""
     base_url: str | None = None
     api_key: str | None = Field(default=None, repr=False)
+    cache_salt: bool | None = None
+    """Send a per-tenant ``cache_salt`` (vLLM prefix-cache isolation). Server default
+    ``False``."""
 
 
 class Model(_Response):
@@ -384,6 +487,15 @@ class Model(_Response):
     context_window: int | None = None
     price_in_per_mtok: float | None = None
     price_out_per_mtok: float | None = None
+    price_cache_read_per_mtok: float | None = None
+    """USD per million prompt tokens read from the provider prompt cache. ``None``:
+    ``price_in_per_mtok``."""
+    price_cache_write_per_mtok: float | None = None
+    """USD per million prompt tokens written to the provider prompt cache (Anthropic, 5-minute
+    TTL). ``None``: ``price_in_per_mtok``."""
+    price_cache_write_1h_per_mtok: float | None = None
+    """USD per million tokens written with the Anthropic 1-hour TTL. ``None``:
+    ``price_cache_write_per_mtok``."""
 
 
 class ModelCreate(_Request):
@@ -404,6 +516,9 @@ class ModelCreate(_Request):
     context_window: int | None = None
     price_in_per_mtok: float | None = None
     price_out_per_mtok: float | None = None
+    price_cache_read_per_mtok: float | None = Field(default=None, ge=0)
+    price_cache_write_per_mtok: float | None = Field(default=None, ge=0)
+    price_cache_write_1h_per_mtok: float | None = Field(default=None, ge=0)
 
 
 class SharedProvider(_Response):
@@ -473,6 +588,9 @@ class Datasource(_Response):
     name: str
     status: DatasourceStatus
     epoch: int | None = None
+    connection: dict[str, Any] | None = None
+    """Redacted connection settings: credentials masked (``****``), ``{env}``/``{file}``
+    references as they are. Credentials are never returned."""
 
 
 class DatasourceCreate(_Request):
@@ -645,6 +763,9 @@ class TenantIntentSet(_Response):
     exemplars: list[str] = Field(default_factory=list)
     """As stored: trimmed, duplicates dropped."""
     source: Literal["api"] = "api"
+    config_version: str | None = None
+    """The snapshot version (``cp-<n>``) that carries the change: a router serves it once its
+    ``/healthz`` reports ``routing.version`` at ``cp-<n>`` or later."""
 
 
 class TenantIntents(_Response):
@@ -781,19 +902,127 @@ class RagDocumentVersions(_Response):
     versions: list[RagDocument]
 
 
+NodeState = Literal["draft", "published", "retired"]
+
+
+class NodeWarning(_Response):
+    """A broad ``allow_tainted`` entry: standing authority for tainted writes (a warning,
+    not a refusal)."""
+
+    kind: str
+    message: str
+    path: str | None = None
+    """e.g. ``tools[1].allow_tainted[0]``."""
+
+
 class Node(_Response):
+    """One immutable node version (``components.schemas.Node``)."""
+
     id: str
+    """Record id (``nodes.delete(tenant_id, id)``)."""
     tenant_id: str
     name: str
     version: int
     spec: dict[str, Any]
+    hash: str | None = None
+    """``sha256:<hex>`` over the canonical spec JSON."""
+    state: NodeState | None = None
+    """``draft``, ``published`` or ``retired``. ``None`` from older servers."""
+    live: bool | None = None
+    """The promotion pointer names this version: what a run without a version runs."""
     created_at: datetime
+    created_by: str | None = None
+    published_at: datetime | None = None
+    retired_at: datetime | None = None
+    warnings: list[NodeWarning] | None = None
+
+
+class NodeLatest(_Response):
+    version: int
+    state: NodeState
+    hash: str
+
+
+class NodeSummary(_Response):
+    """One entry per node (``nodes.summaries``; ``components.schemas.NodeSummary``)."""
+
+    tenant_id: str
+    name: str
+    description: str | None = None
+    """The latest version's ``description``."""
+    kind: Literal["workflow", "agent"] | None = None
+    live_version: int | None = None
+    latest: NodeLatest | None = None
+    versions: int
+    """Versions not deleted."""
+    published: int
+    drafts: int
+    retired: int
+    updated_at: datetime | None = None
+    """The last creation, publication, retirement or promotion."""
+
+
+class NodePromotion(_Response):
+    version: int
+    promoted_at: datetime | None = None
+    promoted_by: str | None = None
+
+
+class NodeVersions(_Response):
+    """``nodes.versions``: every version not deleted, oldest first, and the live one."""
+
+    name: str
+    live: int | None = None
+    """The promoted version; ``None`` when none is."""
+    promotion: NodePromotion | None = None
+    versions: list[Node]
+
+
+class NodeDiffSide(_Response):
+    version: int
+    hash: str | None = None
+    state: str | None = None
+
+
+class NodeDiffChange(_Response):
+    path: str
+    """A JSON pointer into the spec."""
+    op: Literal["added", "removed", "changed"]
+    from_: Any = Field(default=None, alias="from")
+    to: Any = None
+
+
+class NodeDiff(_Response):
+    """``nodes.diff``: two versions' hashes and a structural diff of their specs."""
+
+    name: str
+    from_: NodeDiffSide = Field(alias="from")
+    to: NodeDiffSide
+    identical: bool
+    changes: list[NodeDiffChange] = Field(default_factory=list)
 
 
 class NodeCreate(_Request):
     tenant_id: str
     name: str
     spec: dict[str, Any]
+
+
+class UsageTimings(_Response):
+    """Per-stage durations of a request in milliseconds (``components.schemas.UsageTimings``).
+    A stage that did not run is ``None``. For streams ``upstream_total_ms`` and ``total_ms``
+    run to the end of the stream."""
+
+    auth_ms: float | None = None
+    route_ms: float | None = None
+    """Classification and model choice, ``embed_ms`` included."""
+    embed_ms: float | None = None
+    pii_ms: float | None = None
+    cache_ms: float | None = None
+    upstream_ms: float | None = None
+    """Time to the upstream response headers (first byte)."""
+    upstream_total_ms: float | None = None
+    total_ms: float | None = None
 
 
 class UsageEvent(_Response):
@@ -837,6 +1066,26 @@ class UsageEvent(_Response):
     purpose: UsagePurpose | None = None
     """Work Caliban did on the tenant's behalf (``rag.ingest``, ``rag.search``). ``None`` for
     client calls and node model calls."""
+    cache_write_tokens: int | None = None
+    """Part of ``prompt_tokens`` written to the provider prompt cache (Anthropic). Omitted
+    when 0."""
+    cache_write_1h_tokens: int | None = None
+    """Part of ``cache_write_tokens`` written with the Anthropic 1-hour TTL."""
+    usage_source: Literal["provider", "estimated"] | None = None
+    """``provider``: the provider's usage report. ``estimated``: no complete report arrived
+    (a client disconnect, a failed stream, a model with ``rejects_stream_options``), so the
+    gateway estimated the tokens."""
+    node: str | None = None
+    """Node model calls only: the run's root node."""
+    node_version: int | None = None
+    run_id: str | None = None
+    route: str | None = None
+    """In transit only, never in reports: the path a ``caliban/auto`` request took."""
+    route_fallback: str | None = None
+    """In transit only, never in reports (counted in ``by_route``)."""
+    timings: UsageTimings | None = None
+    """Per-stage durations of the request (the ``Server-Timing`` numbers). ``None`` on events
+    written before the field existed."""
 
 
 class UsageTotals(_Response):
@@ -864,11 +1113,61 @@ class UsageTotals(_Response):
     """Sum over the same events (``0`` on cache hits)."""
     margin_usd: float | None = None
     """``billed_usd - routed_model_cost_usd``."""
+    charged_usd: float | None = None
+    """What the customer is charged: the billed ``caliban/auto`` price, the model's cost
+    otherwise. Over a run's events it equals the run's ``cost_usd``."""
+    cached_prompt_tokens: int | None = None
+    """Prompt tokens read from provider prompt caches."""
+    cache_write_tokens: int | None = None
+    """Prompt tokens written to provider prompt caches."""
+    estimated_requests: int | None = None
+    """Events with ``usage_source="estimated"``."""
 
 
 class UsageByPurpose(_Response):
     purpose: str
     totals: UsageTotals
+
+
+class UsageByNode(_Response):
+    node: str | None = None
+    node_version: int | None = None
+    totals: UsageTotals | None = None
+
+
+class UsageByRoute(_Response):
+    """Requests per tenant, UTC day, intent, deciding stage and fallback reason (empty
+    strings: not set). The only routing record kept."""
+
+    tenant_id: str
+    day: str
+    intent: str
+    route_stage: str
+    route_fallback: str
+    requests: int
+
+
+class NodeSpendAmounts(_Response):
+    daily_usd: float | None = None
+    """``None``: no cap."""
+    monthly_usd: float | None = None
+
+
+class NodeSpend(_Response):
+    """``GET /api/v1/tenants/{tenantId}/node-spend``: what the tenant's node runs spent on
+    model calls today and this month (UTC), next to its ``node_spend_caps``."""
+
+    tenant_id: str
+    day: str
+    """``YYYY-MM-DD`` (UTC)."""
+    month: str
+    """``YYYY-MM`` (UTC)."""
+    today_usd: float
+    month_usd: float
+    caps: NodeSpendAmounts
+    remaining: NodeSpendAmounts
+    capped: bool
+    """A cap is reached: runs stop at their next model call."""
 
 
 class UsageReport(_Response):
@@ -877,6 +1176,10 @@ class UsageReport(_Response):
     by_purpose: list[UsageByPurpose] | None = None
     """The totals per ``purpose``, so retrieval spend is separable from the tenant's own
     calls. ``None`` from older servers."""
+    by_node: list[UsageByNode] | None = None
+    """The same totals per node version (node calls only)."""
+    by_route: list[UsageByRoute] | None = None
+    """Not computed when the report is filtered by node or run."""
 
 
 # ───────────────────────────── evals ─────────────────────────────
@@ -901,11 +1204,20 @@ class GoldenCase(_Request):
     JSON with the output parsed as JSON."""
     checks: list[dict[str, Any]] | None = None
     """``exact``, ``contains``, ``regex``, ``json_schema`` or ``llm_judge`` checks, in the
-    format of :mod:`caliban.evals` datasets."""
+    format of :mod:`caliban.evals` datasets, and server-side only ``tool_call`` checks
+    (``{"type": "tool_call", "tool": "mcp://bank/refund", "args": {...}}``, or
+    ``"must_not_call": True``). An ``llm_judge`` check may carry a ``reference`` answer."""
     answers: dict[str, Any] | None = None
     """Scripted answers to human steps, by step id (``clarify#0``, ``write#0@approve``) or
     vertex id (``clarify``, ``write@approve``)."""
+    tool_results: dict[str, Any] | None = None
+    """Scripted tool results, by tool name (``refund``) or reference. A trial never calls a
+    write tool: the eval sandbox answers this script, else a synthetic result marked
+    ``"sandbox": true``. A read tool named here answers the script too; other reads call the
+    real tool."""
     tags: list[str] | None = None
+    """Free labels. A case captured from a run has ``captured``, its verdict and
+    ``mast:<id>``."""
 
     @classmethod
     def from_case(cls, case: Case) -> GoldenCase:
@@ -1074,7 +1386,9 @@ class GoldenSummary(_Response):
 class InjectionCategory(_Response):
     trials: int
     blocked: int
-    pass_rate: float
+    errors: int | None = None
+    pass_rate: float | None = None
+    """``None`` when no trial of the category was scored."""
 
 
 class NotApplicable(_Response):
@@ -1086,6 +1400,10 @@ class InjectionCaseResult(_Response):
     case: str
     trial: int
     blocked: bool
+    outcome: Literal["blocked", "succeeded", "error"] | None = None
+    error_kind: str | None = None
+    """With ``outcome="error"``: ``quota``, ``provider``, ``timeout``, ``run_not_created``
+    or ``unscored``."""
     attacked: bool | None = None
     defenses: list[str] | None = None
     run_id: str | None = None
@@ -1097,12 +1415,20 @@ class InjectionSummary(_Response):
     suite: Literal["injection"]
     suite_version: int
     trials: int
+    """Scored trials (blocked or succeeded): errors and inapplicable cases are not in them."""
     blocked: int
-    pass_rate: float
-    """Share of attacks blocked."""
-    attack_success_rate: float
+    pass_rate: float | None
+    """Share of the scored attacks blocked; ``None`` when no trial was scored."""
+    attack_success_rate: float | None
     attacks_succeeded: int
     errors: int
+    """Trials that ended on an error (a quota, the provider, a timeout, a run that could not
+    be created): neither blocked nor succeeded."""
+    error_kinds: dict[str, int] | None = None
+    """Errors per kind: ``quota``, ``provider``, ``timeout``, ``run_not_created``,
+    ``unscored``."""
+    inconclusive: bool | None = None
+    """There are errors: the promotion gate does not accept the eval."""
     attacked: int
     """Trials where the model followed the injection."""
     utility_under_attack: float
@@ -1118,7 +1444,7 @@ EvalSummary = Annotated[GoldenSummary | InjectionSummary, Field(discriminator="s
 
 
 class VerdictCheck(_Response):
-    type: Literal["exact", "contains", "regex", "json_schema", "llm_judge"]
+    type: Literal["exact", "contains", "regex", "json_schema", "llm_judge", "tool_call"] | str
     passed: bool
     score: float | None = None
     """The judge's score (``llm_judge``)."""
@@ -1128,6 +1454,11 @@ class GoldenVerdict(_Response):
     run_status: RunStatus
     checks: list[VerdictCheck]
     judge_usd: float | None = None
+    tool_calls: int | None = None
+    """Tool calls the trial's run made (their arguments are in the sealed ``detail``)."""
+    sandboxed_calls: int | None = None
+    """Of them, the ones the eval sandbox answered (every write, and scripted reads): never
+    sent to the tool."""
 
 
 class InjectionVerdict(_Response):
@@ -1159,12 +1490,28 @@ class EvalTrial(_Response):
     cost_usd: float | None = None
     latency_ms: int | None = None
     tokens: int | None = None
-    verdict: TrialError | GoldenVerdict | InjectionVerdict | None = None
-    """Metadata, never content; the shape follows the eval's suite."""
+    verdict: Annotated[
+        TrialError | GoldenVerdict | InjectionVerdict | dict[str, Any] | None,
+        Field(union_mode="left_to_right"),
+    ] = None
+    """Metadata, never content; the shape follows the eval's suite. ``None`` while the trial
+    runs (core sends ``{}`` until it is scored; see :attr:`pending`). A plain ``dict`` for a
+    verdict shape this SDK does not know."""
     detail: Any = None
     """With ``runs.data`` only: the output and what the scorers said, or what the sandboxed
     tools received. ``None`` once run retention purged it (``Eval.content_purged``)."""
     finished_at: datetime | None = None
+
+    @field_validator("verdict", mode="before")
+    @classmethod
+    def _empty_verdict_is_none(cls, v: Any) -> Any:
+        # A trial in flight has an empty verdict object.
+        return None if v == {} else v
+
+    @property
+    def pending(self) -> bool:
+        """The trial is still running: it has no verdict yet."""
+        return self.status == "running" or (self.status is None and self.verdict is None)
 
 
 class Eval(_Response):
@@ -1203,6 +1550,12 @@ class Eval(_Response):
         """The eval ended (succeeded, failed or cancelled)."""
         return self.status in ("succeeded", "failed", "cancelled")
 
+    @property
+    def scored_trials(self) -> int:
+        """Trials of :attr:`trials` that have ended (passed, failed or error), for a progress
+        view of an eval in flight. ``0`` when the trials were not fetched (``evals.list``)."""
+        return sum(1 for t in self.trials or [] if not t.pending)
+
 
 class EvalList(_Response):
     object: str | None = None
@@ -1232,6 +1585,8 @@ class InjectionEvidence(_Response):
     eval: str
     pass_rate: float
     bar: float
+    errors: int | None = None
+    """Always 0: an eval with errors is inconclusive and does not pass."""
 
 
 class GateEvidence(_Response):
@@ -1275,3 +1630,98 @@ class EvalKeyRotation(_Response):
     key: ApiKeyInfo
     revoked: str | None = None
     """The id of the key it replaced."""
+
+
+# ───────────────────────────── runs (console) ─────────────────────────────
+
+
+class ConsoleRun(NodeRun):
+    """A run as the console sees it (``components.schemas.ConsoleRun``). Content
+    (``input``, ``output``, step outputs, the question) only with ``runs.data``
+    (``content_visible``). ``steps`` is the run's timeline."""
+
+    invoker: str | None = None
+    content_visible: bool = False
+    input: Any = None
+    """With ``runs.data``."""
+    mast_label: MastLabel | str | None = None
+    """The MAST failure mode a reviewer labelled the run with when capturing it as ``bad``."""
+
+
+class GoldenCaseCapture(_Request):
+    """Body of ``POST .../runs/{runId}/golden-case``."""
+
+    verdict: Literal["good", "bad"]
+    """``good``: the run did the right thing (it must have succeeded). ``bad``: it did not."""
+    note: str | None = None
+    """What the right behaviour is. Required for ``bad`` (the judge's rubric); added to the
+    rubric for ``good``."""
+    mast_label: MastLabel | None = None
+    """Bad runs only."""
+    version: int | None = Field(default=None, ge=1)
+    """The version whose golden set receives the case (default: the run's)."""
+
+
+class CapturedGoldenCase(_Response):
+    """A run turned into a golden case (``components.schemas.CapturedGoldenCase``)."""
+
+    object: str = "node.golden_case"
+    run_id: str
+    node: str
+    version: int
+    """The version whose golden set holds the case."""
+    run_version: int
+    case_id: str
+    """The run id."""
+    verdict: Literal["good", "bad"]
+    mast_label: MastLabel | str | None = None
+    checks: list[str]
+    """The kinds of the checks derived from the run (``json_schema``, ``llm_judge``,
+    ``tool_call``)."""
+    previous_hash: str | None = None
+    """The set's hash before the capture (``None``: it was created)."""
+    golden_set: GoldenSet
+    content_visible: bool
+    case: GoldenCase | None = None
+    """With ``runs.data``."""
+
+    @field_validator("case", mode="before")
+    @classmethod
+    def _drop_unknown_case_keys(cls, v: Any) -> Any:
+        return _known_keys(GoldenCase, v)
+
+
+class InboxApproval(_Response):
+    """What a gated call would do."""
+
+    tool: str | None = None
+    """The tool reference (``mcp://server/tool#sha256:...``)."""
+    effect: str | None = None
+    labels: list[str] = Field(default_factory=list)
+    """The untrusted taint labels its arguments carry."""
+    arguments: Any = None
+    """With ``runs.data``."""
+
+
+class InboxItem(_Response):
+    """A human step a run waits for: a ``question``, or an ``approval`` of a gated call."""
+
+    run_id: str
+    node: str
+    version: int
+    step: str
+    kind: Literal["question", "approval"]
+    question: str | None = None
+    invoker: str | None = None
+    waiting_since: datetime
+    expires_at: datetime | None = None
+    """When the human step times out."""
+    approval: InboxApproval | None = None
+
+
+class Inbox(_Response):
+    """``inbox.list``: runs waiting for a human, oldest wait first."""
+
+    object: str = "list"
+    content_visible: bool
+    data: list[InboxItem]

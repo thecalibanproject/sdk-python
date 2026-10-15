@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import builtins
 import os
 import time
 import warnings
 from collections.abc import Mapping, Sequence
+from datetime import datetime
 from types import TracebackType
 from typing import Any, Literal, TypeVar
 from urllib.parse import quote
@@ -27,6 +29,9 @@ from .models import (
     ApiKeyCreate,
     ApiKeyCreated,
     ApiKeyInfo,
+    ApiKeyUpdate,
+    CapturedGoldenCase,
+    ConsoleRun,
     Datasource,
     DatasourceCreate,
     DatasourceKind,
@@ -42,6 +47,7 @@ from .models import (
     GateCheck,
     GoldenBar,
     GoldenCase,
+    GoldenCaseCapture,
     GoldenSet,
     GoldenSetPut,
     Health,
@@ -49,13 +55,21 @@ from .models import (
     IntentExemplars,
     IntrospectionJob,
     IntrospectJob,
+    MastLabel,
     Model,
     ModelCapabilities,
     ModelCreate,
     ModelDiscovery,
     ModelKind,
     Node,
+    NodeCaps,
     NodeCreate,
+    NodeDiff,
+    NodeRunList,
+    NodeSpend,
+    NodeSpendCaps,
+    NodeSummary,
+    NodeVersions,
     Ontology,
     OntologyBatchReview,
     OntologyDecision,
@@ -83,6 +97,7 @@ from .models import (
     RagDocumentVersions,
     RagModels,
     RagTrust,
+    RunStatus,
     SemanticCacheSetting,
     SharedProvider,
     SharedProviderCreate,
@@ -93,6 +108,9 @@ from .models import (
     TenantUpdate,
     TrustTier,
     UsageReport,
+)
+from .models import (
+    Inbox as InboxList,
 )
 
 __all__ = ["DEFAULT_ADMIN_URL", "CalibanAdmin"]
@@ -184,10 +202,13 @@ class Tenants(_Resource):
         pii_dictionary: Sequence[PiiTerm | Mapping[str, Any]] | None = None,
         semantic_cache: SemanticCacheSetting | None = None,
         auto_cache_hit_fraction: float | None = None,
+        node_caps: NodeCaps | Mapping[str, Any] | None = None,
+        node_spend_caps: NodeSpendCaps | Mapping[str, Any] | None = None,
+        node_routes: Mapping[str, str] | None = None,
     ) -> Tenant:
         """Create a tenant. ``auto_cache_hit_fraction`` (0..1) overrides the share of the flat
         ``caliban/auto`` price billed for its cache hits; omit it for the deployment value.
-        The PII arguments are those of :meth:`update`."""
+        The PII and node arguments are those of :meth:`update`."""
         body = TenantCreate.model_validate(
             {
                 "name": name,
@@ -199,6 +220,9 @@ class Tenants(_Resource):
                 "pii_dictionary": _pii_list(pii_dictionary),
                 "semantic_cache": semantic_cache,
                 "auto_cache_hit_fraction": auto_cache_hit_fraction,
+                "node_caps": _model_dict(node_caps),
+                "node_spend_caps": _model_dict(node_spend_caps),
+                "node_routes": None if node_routes is None else dict(node_routes),
             }
         ).to_body()
         return self._one(Tenant, self._post("tenants", body))
@@ -214,6 +238,9 @@ class Tenants(_Resource):
         pii_dictionary: Sequence[PiiTerm | Mapping[str, Any]] | None = None,
         semantic_cache: SemanticCacheSetting | None = None,
         auto_cache_hit_fraction: float | Literal["default"] | None = None,
+        node_caps: NodeCaps | Mapping[str, Any] | Literal["default"] | None = None,
+        node_spend_caps: NodeSpendCaps | Mapping[str, Any] | Literal["none"] | None = None,
+        node_routes: Mapping[str, str] | Literal["none"] | None = None,
     ) -> Tenant:
         """Change a tenant's PII, cache and cache-hit billing settings (``PATCH``). Omitted
         fields keep their value.
@@ -229,12 +256,27 @@ class Tenants(_Resource):
         ``semantic_cache="on"`` lets eligible requests use the semantic cache (the deployment
         must enable it too). ``auto_cache_hit_fraction`` (0..1) is the share of the flat
         ``caliban/auto`` price billed when a cache tier answers (no model is called);
-        ``"default"`` clears the override so the deployment value applies. Audited as
+        ``"default"`` clears the override so the deployment value applies.
+        ``node_caps`` (``steps``, ``tokens``, ``wall_clock_s``, ``depth``, ``fanout``, optional
+        ``usd``) caps the budgets of published node versions; ``"default"`` restores the
+        defaults. ``node_spend_caps`` (``daily_usd``, ``monthly_usd``) caps what node runs spend
+        on model calls per UTC day and month; ``"none"`` removes them. ``node_routes`` maps
+        intents ``caliban/auto`` hands to nodes (``{"triage": "node/desk"}``, or
+        ``node/desk@v3``), replaced as a whole; ``"none"`` clears it. Audited as
         ``tenant.update``; routers apply the change with their next snapshot. Raises
         :class:`~caliban.NotFoundError` for an unknown or deleted tenant.
         """
         clear = auto_cache_hit_fraction == "default"
         fraction = None if isinstance(auto_cache_hit_fraction, str) else auto_cache_hit_fraction
+        clear_fields = [
+            name
+            for name, value in (
+                ("node_caps", node_caps),
+                ("node_spend_caps", node_spend_caps),
+                ("node_routes", node_routes),
+            )
+            if isinstance(value, str)
+        ]
         body = TenantUpdate.model_validate(
             {
                 "pii_default": pii_default,
@@ -244,11 +286,28 @@ class Tenants(_Resource):
                 "pii_dictionary": _pii_list(pii_dictionary),
                 "semantic_cache": semantic_cache,
                 "auto_cache_hit_fraction": fraction,
+                "node_caps": None if isinstance(node_caps, str) else _model_dict(node_caps),
+                "node_spend_caps": (
+                    None if isinstance(node_spend_caps, str) else _model_dict(node_spend_caps)
+                ),
+                "node_routes": (
+                    None
+                    if node_routes is None or isinstance(node_routes, str)
+                    else dict(node_routes)
+                ),
             }
         ).to_body()
         if clear:
             body["auto_cache_hit_fraction"] = None
+        for name in clear_fields:
+            body[name] = None
         return self._one(Tenant, self._patch(f"tenants/{_p(tenant_id)}", body))
+
+
+def _model_dict(value: BaseModel | Mapping[str, Any] | None) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    return value.model_dump(exclude_none=True) if isinstance(value, BaseModel) else dict(value)
 
 
 def _pii_list(items: Sequence[BaseModel | Mapping[str, Any]] | None) -> list[Any] | None:
@@ -284,6 +343,38 @@ class ApiKeys(_Resource):
         """
         self._delete(f"tenants/{_p(tenant_id)}/api-keys/{_p(key_id)}")
 
+    def update(
+        self,
+        tenant_id: str,
+        key_id: str,
+        *,
+        nodes: Sequence[str] | Literal["all"] | None = None,
+        datasource_scopes: Sequence[str] | Literal["all"] | None = None,
+    ) -> ApiKeyInfo:
+        """Change a key's node allowlist and datasource scopes (``PATCH``).
+
+        ``None`` keeps a field. ``nodes=["desk"]`` lets the key run only that node (``[]``:
+        none); ``nodes="all"`` lifts the allowlist (every published node of the tenant).
+        ``datasource_scopes`` narrows what the built-in query tool and ``rag_search`` may read
+        for this key; ``"all"`` lifts it (every scope of the nodes it runs). Changing node
+        access needs ``nodes.run`` on the tenant (:class:`~caliban.PermissionDeniedError`
+        otherwise). Audited as ``api_key.update``; routers apply it with their next snapshot.
+        """
+        body = ApiKeyUpdate(
+            nodes=None if nodes is None or isinstance(nodes, str) else [*nodes],
+            datasource_scopes=(
+                None
+                if datasource_scopes is None or isinstance(datasource_scopes, str)
+                else [*datasource_scopes]
+            ),
+        ).to_body()
+        if nodes == "all":
+            body["nodes"] = None
+        if datasource_scopes == "all":
+            body["datasource_scopes"] = None
+        path = f"tenants/{_p(tenant_id)}/api-keys/{_p(key_id)}"
+        return self._one(ApiKeyInfo, self._patch(path, body))
+
 
 class ProviderKeys(_Resource):
     """BYOK provider credentials and local endpoints. Secrets are write-only."""
@@ -301,7 +392,10 @@ class ProviderKeys(_Resource):
         base_url: str | None = None,
         api_key: str | None = None,
         provider_id: str | None = None,
+        cache_salt: bool | None = None,
     ) -> ProviderKey:
+        """Add a BYOK credential or a local endpoint. ``cache_salt=True`` sends a per-tenant
+        ``cache_salt`` (vLLM prefix-cache isolation)."""
         body = ProviderKeyCreate(
             kind=kind,
             label=label,
@@ -309,6 +403,7 @@ class ProviderKeys(_Resource):
             base_url=base_url,
             api_key=api_key,
             provider_id=provider_id,
+            cache_salt=cache_salt,
         ).to_body()
         return self._one(ProviderKey, self._post(f"tenants/{_p(tenant_id)}/provider-keys", body))
 
@@ -339,6 +434,9 @@ class Models(_Resource):
         context_window: int | None = None,
         price_in_per_mtok: float | None = None,
         price_out_per_mtok: float | None = None,
+        price_cache_read_per_mtok: float | None = None,
+        price_cache_write_per_mtok: float | None = None,
+        price_cache_write_1h_per_mtok: float | None = None,
     ) -> Model:
         """Register a model, e.g. an open model served on-prem.
 
@@ -362,6 +460,9 @@ class Models(_Resource):
             "context_window": context_window,
             "price_in_per_mtok": price_in_per_mtok,
             "price_out_per_mtok": price_out_per_mtok,
+            "price_cache_read_per_mtok": price_cache_read_per_mtok,
+            "price_cache_write_per_mtok": price_cache_write_per_mtok,
+            "price_cache_write_1h_per_mtok": price_cache_write_1h_per_mtok,
         }
         overrides = {k: v for k, v in fields.items() if v is not None}
         if spec is None:
@@ -762,8 +863,90 @@ class Rag(_Resource):
 
 
 class Nodes(_Resource):
+    """Nodes and their versions.
+
+    A version is created as a ``draft``, published (validated against the tenant, sealed and
+    shipped to routers and workers), made live with :meth:`promote` (or by :meth:`publish`
+    itself), and retired. Versions are immutable: a change is a new version.
+    """
+
+    @staticmethod
+    def _node(tenant_id: str, name: str) -> str:
+        return f"tenants/{_p(tenant_id)}/nodes/{_p(name)}"
+
     def list(self, *, tenant_id: str | None = None) -> list[Node]:
+        """Every version of every node, with its spec."""
         return self._many(Node, self._get("nodes", {"tenant_id": tenant_id}))
+
+    def summaries(self, *, tenant_id: str | None = None) -> builtins.list[NodeSummary]:
+        """One entry per node, without specs: its live version, its latest version and
+        state, version counts and when it last changed."""
+        params = {"tenant_id": tenant_id, "view": "summary"}
+        return self._many(NodeSummary, self._get("nodes", params))
+
+    def versions(self, tenant_id: str, name: str) -> NodeVersions:
+        """Every version of a node not deleted, oldest first, and the ``live`` one
+        (``nodes.read``)."""
+        return self._one(NodeVersions, self._get(f"{self._node(tenant_id, name)}/versions"))
+
+    def get_version(self, tenant_id: str, name: str, version: int) -> Node:
+        """One version, with its spec and content hash."""
+        path = f"{self._node(tenant_id, name)}/versions/{int(version)}"
+        return self._one(Node, self._get(path))
+
+    def create_version(
+        self,
+        tenant_id: str,
+        name: str,
+        spec: NodeSpec | Mapping[str, Any],
+        *,
+        validate_spec: bool = True,
+    ) -> Node:
+        """Create a draft version, numbered the node's latest plus one (``nodes.write``;
+        audited as ``node.create``). ``spec`` is validated locally first, like
+        :meth:`create`; the server checks it again and content-hashes it."""
+        body = {"spec": _spec_body(spec, validate_spec)}
+        return self._one(Node, self._post(f"{self._node(tenant_id, name)}/versions", body))
+
+    def publish(self, tenant_id: str, name: str, version: int, *, promote: bool = True) -> Node:
+        """Publish a draft (``nodes.publish``; audited as ``node.publish``).
+
+        It is validated against the tenant (subnodes, datasource scopes, budgets against
+        ``node_caps``), sealed and shipped in the signed snapshot. With ``promote`` (the
+        default) it also becomes live, which needs the node's promotion bar met: a version
+        with write tools, or a node with a golden bar, is refused
+        (:class:`~caliban.UnprocessableEntityError`, problems of kind ``eval_gate``) since a
+        draft has no evals yet. Publish it with ``promote=False``, run its evals, then
+        :meth:`promote` it. A version that is not a draft raises
+        :class:`~caliban.ConflictError`.
+        """
+        path = f"{self._node(tenant_id, name)}/versions/{int(version)}/publish"
+        return self._one(Node, self._post(path, {"promote": promote}))
+
+    def promote(self, tenant_id: str, name: str, version: int) -> Node:
+        """Make a published version the live one, or roll back to an earlier one
+        (``nodes.publish``; audited as ``node.promote``).
+
+        Its budgets must fit the tenant's ``node_caps`` and its latest finished evals must
+        meet the promotion bar, its pinned subnodes' too
+        (:class:`~caliban.UnprocessableEntityError`; ``admin.evals.gate`` says the same in
+        advance). A draft or a retired version raises :class:`~caliban.ConflictError`.
+        """
+        path = f"{self._node(tenant_id, name)}/promote"
+        return self._one(Node, self._post(path, {"version": int(version)}))
+
+    def retire(self, tenant_id: str, name: str, version: int) -> Node:
+        """Retire a published version, for good (``nodes.publish``). New runs of it are
+        refused; runs already started finish on it. A version another published version
+        still calls (``node://``) raises :class:`~caliban.ConflictError`."""
+        path = f"{self._node(tenant_id, name)}/versions/{int(version)}/retire"
+        return self._one(Node, self._post(path))
+
+    def diff(self, tenant_id: str, name: str, from_version: int, to_version: int) -> NodeDiff:
+        """Two versions' hashes and a structural diff of their specs (JSON pointers; arrays
+        compared index by index)."""
+        params = {"from": int(from_version), "to": int(to_version)}
+        return self._one(NodeDiff, self._get(f"{self._node(tenant_id, name)}/diff", params))
 
     def create(
         self,
@@ -778,12 +961,7 @@ class Nodes(_Resource):
         ``spec`` is validated locally against the node schema first (disable with
         ``validate_spec=False`` to let the server be the only judge).
         """
-        if isinstance(spec, NodeSpec):
-            spec_body = spec.to_dict()
-        elif validate_spec:
-            spec_body = validate(spec).to_dict()
-        else:
-            spec_body = dict(spec)
+        spec_body = _spec_body(spec, validate_spec)
         body = NodeCreate(tenant_id=tenant_id, name=name, spec=spec_body).to_body()
         return self._one(Node, self._post("nodes", body))
 
@@ -793,6 +971,119 @@ class Nodes(_Resource):
         tenant or is already deleted.
         """
         self._delete(f"tenants/{_p(tenant_id)}/nodes/{_p(node_id)}")
+
+
+def _spec_body(spec: NodeSpec | Mapping[str, Any], validate_spec: bool) -> dict[str, Any]:
+    if isinstance(spec, NodeSpec):
+        return spec.to_dict()
+    if validate_spec:
+        return validate(spec).to_dict()
+    return dict(spec)
+
+
+class Runs(_Resource):
+    """A tenant's node runs, as the console sees them (needs a node journal, else
+    :class:`~caliban.ServiceUnavailableError`). Answers and cancellations are recorded with the
+    caller's identity in the audit chain."""
+
+    @staticmethod
+    def _run(tenant_id: str, run_id: str) -> str:
+        return f"tenants/{_p(tenant_id)}/runs/{_p(run_id)}"
+
+    def list(
+        self,
+        tenant_id: str,
+        *,
+        node: str | None = None,
+        status: RunStatus | Sequence[RunStatus] | None = None,
+        created_after: datetime | str | None = None,
+        created_before: datetime | str | None = None,
+        limit: int | None = None,
+        cursor: str | None = None,
+    ) -> NodeRunList:
+        """One page of run summaries, newest first (``runs.read``). Page with ``cursor``
+        (``next_cursor`` of the previous page)."""
+        if limit is not None and not 1 <= limit <= 200:
+            raise CalibanError("limit must be between 1 and 200")
+        params = {
+            "node": node,
+            "status": status if status is None or isinstance(status, str) else ",".join(status),
+            "created_after": _rfc3339(created_after),
+            "created_before": _rfc3339(created_before),
+            "limit": limit,
+            "cursor": cursor,
+        }
+        return self._one(NodeRunList, self._get(f"tenants/{_p(tenant_id)}/runs", params))
+
+    def get(self, tenant_id: str, run_id: str) -> ConsoleRun:
+        """Status, budget, cost (``cost_usd`` billed, ``model_cost_usd`` the routed models'
+        real cost), usage, the answer guard's ``answer_check`` and the step timeline
+        (``steps``) with ``runs.read``; content too with ``runs.data``."""
+        return self._one(ConsoleRun, self._get(self._run(tenant_id, run_id)))
+
+    def input(
+        self, tenant_id: str, run_id: str, answer: Any, *, step: str | None = None
+    ) -> ConsoleRun:
+        """Answer a question, or approve (``{"approve": True}``) or deny
+        (``{"approve": False}``) a gated call (``runs.answer``). ``step`` defaults to the
+        awaited one. Raises :class:`~caliban.ConflictError` if the run is not waiting (or not
+        for ``step``)."""
+        body: dict[str, Any] = {"answer": answer}
+        if step is not None:
+            body["step"] = step
+        return self._one(ConsoleRun, self._post(f"{self._run(tenant_id, run_id)}/input", body))
+
+    def cancel(self, tenant_id: str, run_id: str) -> ConsoleRun:
+        """Cancel a run (``runs.answer``). A waiting run ends at once; a running one stops at
+        its next step (``cancel_requested``). Raises :class:`~caliban.ConflictError` if it
+        already ended otherwise."""
+        return self._one(ConsoleRun, self._post(f"{self._run(tenant_id, run_id)}/cancel"))
+
+    def capture_golden_case(
+        self,
+        tenant_id: str,
+        run_id: str,
+        *,
+        verdict: Literal["good", "bad"],
+        note: str | None = None,
+        mast_label: MastLabel | None = None,
+        version: int | None = None,
+    ) -> CapturedGoldenCase:
+        """Turn a finished run into a golden case: "save this run as a test"
+        (``nodes.write``; audited as ``node.golden_set.capture``).
+
+        The case (its id is the run id) takes the run's input and its human answers.
+        ``verdict="good"`` (the run must have succeeded) adds an ``llm_judge`` check with the
+        run's output as ``reference`` and a ``tool_call`` check per write it made;
+        ``verdict="bad"`` needs a ``note``, which becomes the judge's rubric, and may carry a
+        ``mast_label`` (stored on the run too). ``version`` sends the case to another version
+        of the same node. Raises :class:`~caliban.ConflictError` if the run has not finished,
+        is already in the set, or the set kept changing, and
+        :class:`~caliban.UnprocessableEntityError` for ``good`` on a run that did not succeed,
+        ``bad`` without a note, or a label on ``good``.
+        """
+        if verdict == "bad" and not note:
+            raise CalibanError("a 'bad' capture needs a note: what the right behaviour is")
+        if verdict == "good" and mast_label is not None:
+            raise CalibanError("a MAST label goes on a 'bad' capture only")
+        body = GoldenCaseCapture(
+            verdict=verdict, note=note, mast_label=mast_label, version=version
+        ).to_body()
+        path = f"{self._run(tenant_id, run_id)}/golden-case"
+        return self._one(CapturedGoldenCase, self._post(path, body))
+
+
+class Inbox(_Resource):
+    """Runs waiting for a human: questions and approvals of gated calls."""
+
+    def list(self, tenant_id: str) -> InboxList:
+        """Oldest wait first (``runs.read``; questions and approval ``arguments`` with
+        ``runs.data``)."""
+        return self._one(InboxList, self._get(f"tenants/{_p(tenant_id)}/inbox"))
+
+
+def _rfc3339(value: datetime | str | None) -> str | None:
+    return value.isoformat() if isinstance(value, datetime) else value
 
 
 class Evals(_Resource):
@@ -995,6 +1286,12 @@ class Usage(_Resource):
             raise CalibanError("limit must be between 1 and 1000")
         return self._one(UsageReport, self._get("usage", {"tenant_id": tenant_id, "limit": limit}))
 
+    def node_spend(self, tenant_id: str) -> NodeSpend:
+        """What the tenant's node runs spent today and this month (UTC) against its
+        ``node_spend_caps``: ``remaining`` (``None``: no cap) and ``capped`` (``usage.read``;
+        :class:`~caliban.ServiceUnavailableError` without a node journal)."""
+        return self._one(NodeSpend, self._get(f"tenants/{_p(tenant_id)}/node-spend"))
+
 
 class CalibanAdmin:
     """Synchronous control-plane client.
@@ -1042,6 +1339,8 @@ class CalibanAdmin:
         self.intents = Intents(self)
         self.rag = Rag(self)
         self.nodes = Nodes(self)
+        self.runs = Runs(self)
+        self.inbox = Inbox(self)
         self.evals = Evals(self)
         self.usage = Usage(self)
 

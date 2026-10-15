@@ -212,3 +212,47 @@ def test_meta_from_an_anthropic_messages_response() -> None:
     meta = CalibanResponseMeta.from_headers(headers)
     assert (meta.request_id, meta.cost_usd, meta.billed_usd) == ("req_m1", 0.0021, 0.01)
     assert (meta.route, meta.run_id, meta.run_status) == ("node/triage@v3", "run_m1", "succeeded")
+
+
+SERVER_TIMING = (
+    'auth;dur=0.210, route;dur=4.810;desc="knn", embed;dur=4.020, pii;dur=1.130, '
+    'cache;dur=0.040;desc="miss", upstream;dur=182.400, upstream_total;dur=611.900, '
+    "total;dur=618.700"
+)
+
+
+def test_server_timing_parses_every_stage_in_order() -> None:
+    t = caliban.ServerTimingEntry.parse(SERVER_TIMING)
+    assert t is not None
+    assert [e.name for e in t] == [
+        "auth", "route", "embed", "pii", "cache", "upstream", "upstream_total", "total",
+    ]  # fmt: skip
+    assert (t[1].dur, t[1].desc) == (4.81, "knn")
+    assert (t[4].dur, t[4].desc) == (0.04, "miss")
+    assert (t[-1].name, t[-1].dur, t[-1].desc) == ("total", 618.7, None)
+
+
+def test_server_timing_node_without_dur_quotes_and_bad_values() -> None:
+    parse = caliban.ServerTimingEntry.parse
+    node = parse('node;desc="run_1", total;dur=3')
+    assert node is not None and [(e.name, e.dur, e.desc) for e in node] == [
+        ("node", None, "run_1"),
+        ("total", 3.0, None),
+    ]
+    quoted = parse('x;desc="a, b; c"')
+    assert quoted is not None and quoted[0].desc == "a, b; c"
+    assert parse(None) is None and parse("  ") is None and parse(", ;dur=1") is None
+    bad = parse("auth;dur=abc, pii;dur=-1")
+    assert bad is not None and [(e.name, e.dur) for e in bad] == [("auth", None), ("pii", None)]
+
+
+def test_server_timing_on_response_meta() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=completion_body(), headers={"Server-Timing": SERVER_TIMING})
+
+    resp = make_client(handler).chat.completions.create(
+        model="caliban/auto", messages=[{"role": "user", "content": "hi"}]
+    )
+    timing = resp.caliban.server_timing
+    assert timing is not None and timing[5].name == "upstream" and timing[5].dur == 182.4
+    assert CalibanResponseMeta.from_headers({}).server_timing is None

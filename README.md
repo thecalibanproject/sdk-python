@@ -47,7 +47,44 @@ This also installs the `caliban-eval` command. For development, see [Development
 
 ## Quick start
 
-You need a running Caliban gateway and a tenant API key (`cal_...`).
+You need a running Caliban gateway and a tenant API key (`cal_...`). The gateway is on `http://localhost:8080` by default.
+
+### Point your existing app at Caliban
+
+If your app already uses the OpenAI or the Anthropic SDK, you do not need this package to start. Change two things, the base URL and the key, and keep your code:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8080/v1",  # was https://api.openai.com/v1
+    api_key="cal_...",  # a tenant key
+)
+resp = client.chat.completions.create(
+    model="caliban/auto",  # or any model id from GET /v1/models
+    messages=[{"role": "user", "content": "Which vendors are overdue?"}],
+)
+```
+
+```python
+from anthropic import Anthropic
+
+client = Anthropic(
+    base_url="http://localhost:8080",  # the gateway root: the SDK adds /v1/messages
+    api_key="cal_...",  # sent as x-api-key, which Caliban accepts
+)
+msg = client.messages.create(
+    model="caliban/auto",
+    max_tokens=1024,
+    messages=[{"role": "user", "content": "Which vendors are overdue?"}],
+)
+```
+
+Every request now goes through the tenant's PII screening, cache and routing. `caliban/auto` lets the router pick the model; a model id you already use keeps working if the tenant has it (`GET /v1/models` lists them). To see what Caliban did, read the `x-caliban-*` response headers (`with_raw_response` in both SDKs; `CalibanResponseMeta.from_headers` parses them), or open the tenant's usage in the console. [Using the stock OpenAI and Anthropic SDKs](#using-the-stock-openai-and-anthropic-sdks) shows how to pass the `caliban` options through them.
+
+### With this SDK
+
+`Caliban` speaks the same OpenAI wire format, types the `caliban` options and parses the response headers for you:
 
 ```python
 from caliban import Caliban
@@ -63,6 +100,8 @@ resp = client.chat.completions.create(
 print(resp.text)
 print(resp.caliban.routed_model, resp.caliban.cache, resp.caliban.pii_entities)
 ```
+
+A missing key raises a `CalibanError` that names the fix: pass `api_key=` or set `CALIBAN_API_KEY`.
 
 ## Core concepts
 
@@ -123,6 +162,7 @@ The gateway reports what it did in `x-caliban-*` response headers. Completions, 
 | `x-caliban-route-fallback` | `route_fallback` | Why `caliban/auto` answered with a model rather than a node (`low_confidence`, `no_node_for_intent`, ...). |
 | `Caliban-Run-Id` | `run_id` | The node run that answered. |
 | `x-caliban-run-status` | `run_status` | Its status, for example `succeeded` or `input_required`. |
+| `Server-Timing` | `server_timing` | The gateway's per-stage durations in ms, in pipeline order: a list of `ServerTimingEntry` (`name`, `dur`, `desc`) for `auth`, `route` (`desc`: the deciding stage), `embed`, `pii`, `cache` (`desc`: `hit` or `miss`), `upstream`, `upstream_total`, `node` (`desc`: the run id) and `total`. `None` when the gateway has it off (`[telemetry] server_timing = false`). `ServerTimingEntry.parse(value)` works on a raw header. |
 
 A node answer (`model="node/<name>"`, or `caliban/auto` handing the request to a node) carries the headers of every chat response: `request_id`, `routed_model` (`node/<name>@v<N>`), `cache="bypass"`, and on non-streaming answers `pii_entities` (the entities protected across the run's model calls), `cost_usd` and `billed_usd`.
 
@@ -190,6 +230,9 @@ Caliban(
 | `embeddings.create(...)` | `POST /v1/embeddings` | `CreateEmbeddingResponse` |
 | `rerank.create(...)` | `POST /v1/rerank` | `RerankResponse` |
 | `models.list()` | `GET /v1/models` | `ModelList` |
+| `runs.create(node, ...)` | `POST /v1/nodes/{node}/runs` | `NodeRun` |
+| `runs.get(run_id)`, `runs.input(run_id, answer)`, `runs.cancel(run_id)` | `GET /v1/runs/{id}`, `POST .../input`, `POST .../cancel` | `NodeRun` |
+| `runs.list(...)` | `GET /v1/runs` | `NodeRunList` |
 
 `chat.completions.create` takes `model`, `messages`, `stream`, `caliban`, `temperature`, `max_tokens` and `tools`. Any other keyword argument (`top_p`, `response_format`, `seed`, ...) is passed through in the body. Every method also accepts `timeout=`, and the `create` methods accept `extra_body=` and `extra_headers=`.
 
@@ -226,6 +269,26 @@ for r in res.results:  # best first
 ```
 
 `results` keep the server's order (highest `relevance_score` first) and `index` points into `documents`. The SDK raises `CalibanError` before sending for a non-string query, an empty or non-string `documents` list, or an invalid `top_n`. Text sent outside the trust boundary is PII-masked; returned documents are always your originals.
+
+**Node runs.** Run a published node (an agent or a workflow) with structured input, follow it, and answer its human steps. The API key must be allowed to run the node.
+
+```python
+run = client.runs.create(
+    "invoice-triage",
+    input={"email": {"from": "ap@acme.test", "body": email_text}},
+    untrusted=["/email/body"],  # caller data: carries the `caller` taint label
+    idempotency_key="email-8812",  # a retry returns the run the first request created
+)
+while run.status == "input_required" and run.awaiting:
+    print(run.awaiting.question)
+    run = client.runs.input(run.id, {"approve": True}, step=run.awaiting.step)
+    run = client.runs.wait(run.id, timeout_s=120)  # until it ends or asks again
+print(run.status, run.output, run.cost_usd)
+for step in run.steps:  # the run's timeline
+    print(step.started_at, step.id, step.status, step.duration_ms, step.usd)
+```
+
+`create` is sync by default: it returns when the run ends or waits for a human, or after the server's wait (`wait_s`) with the run so far, so check `status` (or `run.done`). `async_=True` returns the pending run at once. Pass exactly one of `input` (checked against the node's input schema) and chat `messages`; `version` pins a published version (default: the live one) and `budget` can only lower the version's. Without `idempotency_key` a `create` is not retried on 502. `runs.list(node=, version=, status=, created_after=, created_before=, limit=, cursor=)` returns summaries, newest first. Streaming a run's events (`stream: true`, `GET /v1/runs/{id}/events`) is not wrapped yet; `runs.wait` polls instead.
 
 The async client has the same methods:
 
@@ -280,7 +343,7 @@ print(admin.usage.get(tenant_id=t.id, limit=100).totals)
 | Resource | Methods |
 |---|---|
 | `tenants` | `list` (`include_deleted=`), `get`, `create`, `update`, `delete` |
-| `api_keys` | `list` (`include_revoked=`), `create`, `revoke` |
+| `api_keys` | `list` (`include_revoked=`), `create`, `update` (`nodes=`, `datasource_scopes=`; `"all"` lifts either), `revoke` |
 | `provider_keys` | `list`, `create`, `delete` |
 | `models` | `list`, `create`, `delete` |
 | `providers` | `list`, `create`, `delete`, `health`, `discover` |
@@ -288,9 +351,13 @@ print(admin.usage.get(tenant_id=t.id, limit=100).totals)
 | `ontology` | `get`, `review`, `approve`, `reject`, `deprecate`, `review_batch`, `propose` |
 | `intents` | `list`, `put` (`set` is a deprecated alias), `delete` (the tenant's `caliban/auto` exemplars) |
 | `rag` | `models`, `collections.list`, `.create`, `.get`, `.delete`, `documents.list`, `.ingest`, `.get`, `.delete`, `.release` |
-| `nodes` | `list`, `create` (validates `spec` locally first; `validate_spec=False` skips that), `delete` |
+| `nodes` | `list`, `summaries`, `create` (validates `spec` locally first; `validate_spec=False` skips that), `versions`, `get_version`, `create_version`, `publish`, `promote`, `retire`, `diff`, `delete` (see [Node versions](#node-versions-publish-and-make-live)) |
+| `runs` | `list`, `get`, `input`, `cancel`, `capture_golden_case` (a tenant's node runs, as the console sees them) |
+| `inbox` | `list` (runs waiting for a human) |
 | `evals` | `get_golden_set`, `put_golden_set`, `delete_golden_set`, `get_policy`, `set_policy`, `start`, `list`, `get`, `cancel`, `wait`, `gate`, `get_key`, `rotate_key` (see [Server-side evals](#server-side-evals-and-the-promotion-gate)) |
-| `usage` | `get` (`limit` between 1 and 1000) |
+| `usage` | `get` (`limit` between 1 and 1000), `node_spend` (node spend today and this month against the tenant's caps) |
+
+Tool servers, routes, the audit log, KEK status, roles, users and role bindings have no helper yet.
 
 The constructor takes `token`, `base_url`, `timeout` (default 30 s), `max_retries`, `default_headers` and `http_client`. GET and DELETE requests retry on 429, 502 and 503. POST and PATCH requests retry only on 429 and 503, because a 502 may mean the server already acted (see [Retries](#retries)). The response models live in `caliban.admin.models`.
 
@@ -307,6 +374,9 @@ The constructor takes `token`, `base_url`, `timeout` (default 30 s), `max_retrie
 | `pii_dictionary` | list of `PiiTerm` or mappings (at most 10 000) | `[]` | Whole-word, case-insensitive terms to protect: `{term, label}` (customer names, internal codes); the label is case-insensitive too. Replaced as a whole; `[]` clears it. Audited as a count of terms, never the terms. |
 | `semantic_cache` | `"off"`, `"on"` | `"off"` | Whether the tenant's eligible requests may use the semantic cache. |
 | `auto_cache_hit_fraction` | `0` to `1`, or `"default"` | deployment value | Share of the flat `caliban/auto` price billed for the tenant's cache hits. `"default"` clears the override, so the deployment's `[routing] auto_cache_hit_fraction` (0.2 unless configured) applies. |
+| `node_caps` | `NodeCaps` or a mapping, or `"default"` | steps 200, tokens 2 000 000, wall_clock_s 3600, depth 5, fanout 32 | Caps the budgets of published node versions must fit; with `usd`, every version must declare `budgets.usd` within it. `"default"` restores the defaults. |
+| `node_spend_caps` | `NodeSpendCaps` or a mapping, or `"none"` | none | What node runs may spend on model calls per UTC day (`daily_usd`) and month (`monthly_usd`), across workers. A cap reached ends runs as `budget_exhausted`. `"none"` removes them; `admin.usage.node_spend(t.id)` shows where the tenant stands. |
+| `node_routes` | mapping of intent to `node/<name>`, `node/<name>@published` or `node/<name>@v<N>`, or `"none"` | config file | Intents `caliban/auto` hands to the tenant's nodes, over the config file's, intent by intent. Replaced as a whole; `"none"` clears it. |
 
 ```python
 admin.tenants.update(t.id, semantic_cache="on")
@@ -338,11 +408,15 @@ These fields are `None` on tenants from an older server.
 | `flat_price_usd` | `caliban/auto` | The full flat auto price for the same tokens. On a cache hit, the flat price of the cached answer's tokens (what a miss would have billed). |
 | `billed_usd` | `caliban/auto` | What the customer is billed: `flat_price_usd` on a miss, `flat_price_usd` times the tenant's cache-hit fraction on a hit. |
 | `saved_usd` | Priced cache hits | What the hit saved: `flat_price_usd - billed_usd` for `caliban/auto`, the avoided model cost for other models. |
+| `timings` | Events from a current gateway | Per-stage durations in ms (`UsageTimings`): `auth_ms`, `route_ms`, `embed_ms`, `pii_ms`, `cache_ms`, `upstream_ms` (to the first byte), `upstream_total_ms`, `total_ms`. The same numbers as the `Server-Timing` response header; a stage that did not run is `None`. |
+| `cache_write_tokens`, `cache_write_1h_tokens` | Provider prompt-cache writes | Part of `prompt_tokens` written to the provider prompt cache (Anthropic), and of those, written with the 1-hour TTL. Priced with the model's `price_cache_write_per_mtok` and `price_cache_write_1h_per_mtok`. |
+| `usage_source` | Every event from a current gateway | `"provider"` (the provider's usage report) or `"estimated"` (no complete report arrived: a client disconnect, a failed stream, or a model with `rejects_stream_options`). |
+| `node`, `node_version`, `run_id` | Node model calls | The run's root node, its version and the run. |
 | `purpose` | Work Caliban did for the tenant | `"rag.ingest"` (embedding a collection's documents) or `"rag.search"` (a node's retrieval query, its embedding and reranking). `None` on client calls and node model calls. |
 
-`by_purpose` gives the same totals per `purpose` (`UsageByPurpose`), so retrieval spend is separable from the tenant's own calls; it is `None` from an older server.
+`by_purpose` gives the same totals per `purpose` (`UsageByPurpose`), so retrieval spend is separable from the tenant's own calls; it is `None` from an older server. `by_node` gives them per node version (`UsageByNode`), and `by_route` counts requests per tenant, UTC day, intent, deciding stage and fallback reason (`UsageByRoute`), the only routing record kept: reported events never carry their intent or route.
 
-`totals` adds `semantic_cache_hits` (`cache_hits` counts both tiers), `saved_usd` (what cache hits saved, all models), `auto_requests` (requests for `caliban/auto`) and `auto_cache_hits`, and, summed over the `caliban/auto` events that carry both prices, `flat_price_usd`, `billed_usd`, `auto_saved_usd`, `routed_model_cost_usd` and `margin_usd` (`billed_usd - routed_model_cost_usd`).
+`totals` adds `charged_usd` (what the customer is charged: the billed `caliban/auto` price, the model's cost otherwise), `cached_prompt_tokens` and `cache_write_tokens` (provider prompt caches), `estimated_requests` (events with `usage_source="estimated"`), `semantic_cache_hits` (`cache_hits` counts both tiers), `saved_usd` (what cache hits saved, all models), `auto_requests` (requests for `caliban/auto`) and `auto_cache_hits`, and, summed over the `caliban/auto` events that carry both prices, `flat_price_usd`, `billed_usd`, `auto_saved_usd`, `routed_model_cost_usd` and `margin_usd` (`billed_usd - routed_model_cost_usd`).
 
 ```python
 totals = admin.usage.get(tenant_id=t.id).totals
@@ -429,6 +503,65 @@ revoked = [k for k in admin.api_keys.list(other_id, include_revoked=True) if k.r
 - A deleted tenant's id cannot be reused, and every tenant-scoped call for it raises `NotFoundError`.
 - A standalone deployment rejects a revoked key on the next request. A split-mode router stops accepting it after its next snapshot poll (`CALIBAN_SNAPSHOT_POLL_SECS`, 10 s by default).
 - `Tenant` has `status` (`"active"` or `"deleted"`) and `deleted_at`; `ApiKeyInfo` has `revoked_at`. They are optional and `None` when an older server omits them.
+
+#### Node versions: publish and make live
+
+A node version is created as a `draft`, published (validated against the tenant, sealed and shipped to routers and workers), made live, and eventually retired. Versions are immutable: a change is a new version. `live` marks the version the promotion pointer names: what a run without a version, and `model="node/<name>"`, run.
+
+```python
+draft = admin.nodes.create_version(t.id, "desk", load_node("desk.yaml"))  # state="draft"
+
+# "Go live": publish without promoting, evaluate, check the gate, then promote.
+admin.nodes.publish(t.id, "desk", draft.version, promote=False)
+for suite in ("golden", "injection"):
+    e = admin.evals.start(t.id, "desk", draft.version, suite=suite)
+    admin.evals.wait(t.id, e.id, timeout_s=1800)
+if admin.evals.gate(t.id, "desk", draft.version).allowed:
+    admin.nodes.promote(t.id, "desk", draft.version)  # live=True
+
+versions = admin.nodes.versions(t.id, "desk")  # oldest first; versions.live is the live one
+admin.nodes.promote(t.id, "desk", 2)  # roll back
+for c in admin.nodes.diff(t.id, "desk", 2, 3).changes:
+    print(c.op, c.path)  # JSON pointers into the spec
+admin.nodes.retire(t.id, "desk", 1)  # final; runs already started finish on it
+print([(n.name, n.live_version) for n in admin.nodes.summaries(tenant_id=t.id)])
+```
+
+- `publish` promotes by default. A version with write tools, or a node with a golden bar, cannot be promoted as a draft (it has no evals yet): that raises `UnprocessableEntityError` (problems of kind `eval_gate`). Publish it with `promote=False`, run its evals, then `promote`.
+- `promote` checks the version's budgets against the tenant's `node_caps` and its latest finished evals against the promotion bar, its pinned subnodes' too; `evals.gate` gives the same answer in advance. A draft or a retired version raises `ConflictError`.
+- `retire` is final. A version another published version still calls (`node://`) raises `ConflictError`.
+- `nodes.create(tenant_id=..., name=..., spec=...)` is `create_version` with the tenant and name in the body.
+
+#### Node runs, the inbox, and saving a run as a test
+
+`admin.runs` sees a tenant's node runs as the console does. `list` (filters `node`, `status`, `created_after`, `created_before`; pages with `cursor`) and `get` need `runs.read`; content (`input`, `output`, step outputs, the question) comes only with `runs.data` (`content_visible`). A `ConsoleRun`'s `steps` are its timeline (`RunStep`: id, vertex, kind, status, tokens, `usd`, `started_at`, `duration_ms`), next to its `budget`, `cost_usd` (billed), `model_cost_usd` (the routed models' real cost) and `answer_check`. `input` and `cancel` need `runs.answer` and are audited with the caller's identity. `admin.inbox.list(tenant_id)` lists the runs waiting for a human, oldest wait first; an approval carries `approval` (the tool, its effect, the taint labels of its arguments, and the `arguments` with `runs.data`).
+
+```python
+for item in admin.inbox.list(t.id).data:
+    if item.kind == "approval" and item.approval:
+        ok = all(label == "datasource" for label in item.approval.labels)
+        admin.runs.input(t.id, item.run_id, {"approve": ok}, step=item.step)
+
+run = admin.runs.get(t.id, run_id)
+for step in run.steps:
+    print(step.started_at, step.id, step.status, step.duration_ms, step.usd)
+```
+
+**Save a run as a test.** `runs.capture_golden_case(tenant_id, run_id, verdict=...)` turns a finished run into a case of its version's golden set (`nodes.write`), so production feedback feeds the eval loop. The case id is the run id; it takes the run's input and its human answers. `verdict="good"` (the run must have succeeded) adds an `llm_judge` check with the run's output as `reference` and a `tool_call` check for each write it made. `verdict="bad"` needs a `note`, which becomes the judge's rubric, and may carry a `mast_label` (a MAST failure mode, `MastLabel`), stored on the run too (`mast_label` on `runs.get` and `runs.list`).
+
+```python
+admin.runs.capture_golden_case(t.id, good_run_id, verdict="good")
+c = admin.runs.capture_golden_case(
+    t.id,
+    bad_run_id,
+    verdict="bad",
+    note="It must ask for the invoice number before refunding.",
+    mast_label="premature_termination",
+)
+print(c.case_id, c.checks, c.golden_set.hash)  # c.case with runs.data
+```
+
+`bad` without a note and a label on `good` raise `CalibanError` before anything is sent. The server raises `ConflictError` when the run has not finished, is already in the set, or the set kept changing (the capture is a compare-and-set on the set's hash), and `UnprocessableEntityError` for `good` on a run that did not succeed or an injection-suite run. Like any POST it is not retried on 502.
 
 ### Open models on-prem
 
@@ -630,7 +763,8 @@ admin.evals.set_policy(
     injection={"min_pass_rate": 1.0},
 )
 
-# The version is published with {"promote": false}, evaluated, then promoted.
+# The version is published with promote=False, evaluated, then promoted
+# (see Node versions above).
 for suite in ("golden", "injection"):
     e = admin.evals.start("acme", "triage", 3, suite=suite)
     e = admin.evals.wait("acme", e.id, timeout_s=1800)
@@ -641,7 +775,10 @@ print(gate.allowed, gate.evidence, [p.message for p in gate.problems])
 ```
 
 - Evals run as the tenant's eval key: an API key the control plane creates on the first eval that names no key and manages itself (its plaintext never leaves the control plane; the data plane refuses it). The eval's runs and judge calls are limited and metered as that key. `get_key` shows it (`purpose="eval"`), `rotate_key` replaces it (rotate between evals: evals in flight lose their key), and `api_keys.revoke` refuses it with a `409`. Pass `api_key_id` to `start` to run an eval as a customer API key instead.
-- `summary` is typed by suite (`GoldenSummary`: pass^k, cost per success, latency, per case; `InjectionSummary`: pass rate, attack success rate, utility under attack, per category), and so is each trial's `verdict` (`GoldenVerdict`, `InjectionVerdict`, or `TrialError` when its run could not be created). `content_purged` says run retention cleared the trials' `detail`; summaries and verdicts stay.
+- `summary` is typed by suite (`GoldenSummary`: pass^k, cost per success, latency, per case; `InjectionSummary`: pass rate, attack success rate, utility under attack, per category), and so is each trial's `verdict` (`GoldenVerdict` with each check's result and the trial's `tool_calls` and `sandboxed_calls`, `InjectionVerdict`, or `TrialError` when its run could not be created; a plain `dict` for a shape this SDK does not know). `content_purged` says run retention cleared the trials' `detail`; summaries and verdicts stay.
+- **Evals in flight.** `evals.get` works while an eval is `pending` or `running`: `summary` is `None`, and a trial still running has `pending=True` and `verdict=None` (core sends `{}` until the trial is scored). `e.done` and `e.scored_trials` drive a progress view; `wait` polls until `done`.
+- **Errors are not failures.** A trial that ends on a quota, the provider, a timeout or a run that could not be created is an error. An injection summary then has `errors`, `error_kinds` and `inconclusive=True`, its `pass_rate` and `attack_success_rate` are `None` when no trial was scored, and the gate does not accept it.
+- **Write tools never run in an eval.** Every call to a tool with effect `write` goes to the eval sandbox, which answers the case's `tool_results` (by tool name or reference) or a synthetic result marked `"sandbox": true`; reads call the real tools unless scripted. A `tool_call` check (`{"type": "tool_call", "tool": "mcp://bank/refund", "args": {...}}`, or `"must_not_call": True`) asserts on those calls, and an `llm_judge` check takes a `reference` answer. Both are server-side only: the local harness does not run them.
 - `gate` returns typed `evidence` (with each pinned subnode's own evidence under `subnodes`) and `problems`; a problem's `path` names a subnode whose own gate failed.
 - `get_golden_set` returns the cases only to a caller with `runs.data` (`content_visible`); `evals.get` returns the trials, with their `detail` under the same permission.
 - `set_policy` replaces the whole bar: leaving `golden` out removes the golden gate, and an injection eval stays required for versions with write tools whatever `injection` says.

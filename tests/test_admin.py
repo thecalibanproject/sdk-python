@@ -16,6 +16,7 @@ from caliban import (
     ConflictError,
     NotFoundError,
     OntologyBreakingChangeError,
+    UnprocessableEntityError,
     UpstreamError,
 )
 from caliban.admin import models as m
@@ -1524,3 +1525,600 @@ def test_injection_verdict_answer_integrity() -> None:
         }
     )
     assert (v.category, v.defenses) == ("answer_integrity", ["answer_guard"])
+
+
+# ─────────────────── contract drift (core 45d1b16) ───────────────────
+
+
+def test_tenant_node_caps_spend_caps_and_routes(admin: CalibanAdmin) -> None:
+    caps = {"steps": 50, "tokens": 200000, "wall_clock_s": 600, "depth": 3, "fanout": 8}
+    tenant = {
+        **TENANT,
+        "node_caps": {**caps, "usd": 2.5, "future": 1},
+        "node_spend_caps": {"daily_usd": 5, "monthly_usd": None},
+        "node_routes": {"triage": "node/desk"},
+    }
+    r = router(admin)
+    create = r.post("/tenants").respond(201, json=tenant)
+    patch = r.patch("/tenants/t1").respond(200, json=TENANT)
+
+    t = admin.tenants.create(
+        name="Acme",
+        node_caps=m.NodeCaps(**caps),
+        node_spend_caps={"daily_usd": 5},
+        node_routes={"triage": "node/desk@v3"},
+    )
+    assert json.loads(create.calls.last.request.content) == {
+        "name": "Acme",
+        "node_caps": caps,
+        "node_spend_caps": {"daily_usd": 5},
+        "node_routes": {"triage": "node/desk@v3"},
+    }
+    assert t.node_caps is not None and t.node_caps.usd == 2.5
+    assert t.node_spend_caps is not None and t.node_spend_caps.daily_usd == 5
+    assert t.node_routes == {"triage": "node/desk"}
+    # Older servers: absent.
+    assert admin.tenants.update("t1", node_routes={"faq": "node/kb@published"}).node_caps is None
+    assert json.loads(patch.calls.last.request.content) == {
+        "node_routes": {"faq": "node/kb@published"}
+    }
+    # Explicit nulls: defaults back, caps removed, routes cleared.
+    admin.tenants.update("t1", node_caps="default", node_spend_caps="none", node_routes="none")
+    assert json.loads(patch.calls.last.request.content) == {
+        "node_caps": None,
+        "node_spend_caps": None,
+        "node_routes": None,
+    }
+    with pytest.raises(ValueError, match="pattern"):
+        admin.tenants.update("t1", node_routes={"faq": "kb"})
+
+
+def test_api_key_scopes_and_update(admin: CalibanAdmin) -> None:
+    info = {"id": "k1", "name": "ci", "prefix": "cal_abcd", "created_at": TS}
+    r = router(admin)
+    patch = r.patch("/tenants/t1/api-keys/k1").respond(
+        200, json={**info, "nodes": ["desk"], "datasource_scopes": ["erp.invoices:read"]}
+    )
+    key = admin.api_keys.update("t1", "k1", nodes=["desk"], datasource_scopes=["erp.invoices:read"])
+    assert (key.nodes, key.datasource_scopes) == (["desk"], ["erp.invoices:read"])
+    assert json.loads(patch.calls.last.request.content) == {
+        "nodes": ["desk"],
+        "datasource_scopes": ["erp.invoices:read"],
+    }
+    admin.api_keys.update("t1", "k1", nodes="all")
+    assert json.loads(patch.calls.last.request.content) == {"nodes": None}
+    admin.api_keys.update("t1", "k1", nodes=[], datasource_scopes="all")
+    assert json.loads(patch.calls.last.request.content) == {
+        "nodes": [],
+        "datasource_scopes": None,
+    }
+
+
+def test_api_key_update_not_retried_on_502(admin: CalibanAdmin) -> None:
+    route = router(admin).patch("/tenants/t1/api-keys/k1").respond(502)
+    with pytest.raises(UpstreamError):
+        admin.api_keys.update("t1", "k1", nodes=["desk"])
+    assert route.call_count == 1
+
+
+def test_catalogue_and_provider_fields(admin: CalibanAdmin) -> None:
+    model = {
+        "id": "anthropic/claude",
+        "provider_id": "anthropic",
+        "upstream_model": "claude",
+        "trust_tier": "t2_contracted",
+        "kind": "chat",
+        "capabilities": {"tools": True, "rejects_stream_options": True},
+        "price_in_per_mtok": 3,
+        "price_cache_read_per_mtok": 0.3,
+        "price_cache_write_per_mtok": 3.75,
+        "price_cache_write_1h_per_mtok": 6,
+    }
+    pk = {
+        "id": "p1",
+        "tenant_id": "t1",
+        "kind": "openai_compatible",
+        "label": "vllm",
+        "trust_tier": "t0_sovereign",
+        "cache_salt": True,
+        "created_at": TS,
+    }
+    r = router(admin)
+    post_model = r.post("/models").respond(201, json=model)
+    post_pk = r.post("/tenants/t1/provider-keys").respond(201, json=pk)
+    r.get("/health").respond(
+        200, json={"status": "ok", "version": "0.1.0", "mode": "control-plane", "store": "postgres"}
+    )
+    r.get("/datasources").respond(
+        200,
+        json=[
+            {
+                "id": "d1",
+                "tenant_id": "t1",
+                "kind": "mongodb",
+                "name": "sales",
+                "status": "ready",
+                "connection": {"uri": "mongodb://app:****@mongo:27017", "database": "sales"},
+            }
+        ],
+    )
+
+    got = admin.models.create(
+        id="anthropic/claude",
+        provider="anthropic",
+        upstream_model="claude",
+        trust_tier="t2_contracted",
+        price_cache_read_per_mtok=0.3,
+        price_cache_write_1h_per_mtok=6,
+    )
+    sent = json.loads(post_model.calls.last.request.content)
+    assert (sent["price_cache_read_per_mtok"], sent["price_cache_write_1h_per_mtok"]) == (0.3, 6)
+    assert (got.price_cache_write_per_mtok, got.capabilities.rejects_stream_options) == (3.75, True)
+    with pytest.raises(ValueError, match="greater than or equal to 0"):
+        admin.models.create(
+            id="x/y", provider="x", upstream_model="y", trust_tier="t3_public",
+            price_cache_read_per_mtok=-1,
+        )  # fmt: skip
+    assert admin.provider_keys.create(
+        "t1", kind="openai_compatible", label="vllm", trust_tier="t0_sovereign", cache_salt=True
+    ).cache_salt
+    assert json.loads(post_pk.calls.last.request.content)["cache_salt"] is True
+    assert admin.health().store == "postgres"
+    conn = admin.datasources.list()[0].connection
+    assert conn is not None and conn["uri"] == "mongodb://app:****@mongo:27017"
+
+
+def test_intent_put_reports_config_version(admin: CalibanAdmin) -> None:
+    router(admin).put("/tenants/t1/intents/faq").respond(
+        200,
+        json={
+            "tenant_id": "t1",
+            "intent": "faq",
+            "exemplars": ["how do I"],
+            "source": "api",
+            "config_version": "cp-42",
+        },
+    )
+    assert admin.intents.put("t1", "faq", ["how do I"]).config_version == "cp-42"
+
+
+def test_usage_timings_cache_writes_node_and_routes(admin: CalibanAdmin) -> None:
+    event = {
+        **USAGE_BASE,
+        "cache_write_tokens": 1200,
+        "cache_write_1h_tokens": 200,
+        "usage_source": "estimated",
+        "node": "desk",
+        "node_version": 3,
+        "run_id": "run_1",
+        "timings": {"auth_ms": 0.21, "route_ms": 4.81, "upstream_ms": 182.4, "total_ms": 618.7},
+    }
+    totals = {"requests": 1, "charged_usd": 0.01, "cached_prompt_tokens": 40,
+              "cache_write_tokens": 1200, "estimated_requests": 1}  # fmt: skip
+    by_route = {"tenant_id": "t1", "day": "2026-10-15", "intent": "faq", "route_stage": "knn",
+                "route_fallback": "", "requests": 4}  # fmt: skip
+    router(admin).get("/usage").respond(
+        200,
+        json={
+            "events": [event],
+            "totals": totals,
+            "by_node": [{"node": "desk", "node_version": 3, "totals": totals}],
+            "by_route": [by_route],
+        },
+    )
+    rep = admin.usage.get(tenant_id="t1")
+    e = rep.events[0]
+    assert (e.cache_write_tokens, e.cache_write_1h_tokens, e.usage_source) == (
+        1200,
+        200,
+        "estimated",
+    )
+    assert (e.node, e.node_version, e.run_id) == ("desk", 3, "run_1")
+    assert e.timings is not None and (e.timings.route_ms, e.timings.pii_ms) == (4.81, None)
+    assert (rep.totals.charged_usd, rep.totals.estimated_requests) == (0.01, 1)
+    assert rep.by_node is not None and rep.by_node[0].totals is not None
+    assert rep.by_route is not None and rep.by_route[0].requests == 4
+
+
+def test_node_spend(admin: CalibanAdmin) -> None:
+    router(admin).get("/tenants/t1/node-spend").respond(
+        200,
+        json={
+            "tenant_id": "t1",
+            "day": "2026-10-15",
+            "month": "2026-10",
+            "today_usd": 1.25,
+            "month_usd": 30,
+            "caps": {"daily_usd": 5, "monthly_usd": None},
+            "remaining": {"daily_usd": 3.75, "monthly_usd": None},
+            "capped": False,
+        },
+    )
+    spend = admin.usage.node_spend("t1")
+    assert (spend.remaining.daily_usd, spend.remaining.monthly_usd) == (3.75, None)
+    assert (spend.today_usd, spend.capped) == (1.25, False)
+
+
+# ─────────────────── evals in flight ───────────────────
+
+
+def test_eval_in_flight_parses(admin: CalibanAdmin) -> None:
+    running = {
+        **EVAL,
+        "status": "running",
+        "summary": None,
+        "claims": 1,
+        "cancel_requested": False,
+        "content_purged": False,
+        "started_at": TS,
+        "finished_at": None,
+        "content_visible": False,
+        "trials": [
+            # What core sends for a trial whose run is not scored yet.
+            {"case": "chest", "trial": 0, "run_id": "run_1", "status": "running",
+             "cost_usd": 0, "latency_ms": 0, "tokens": 0, "verdict": {}, "finished_at": None},
+            {"case": "refund", "trial": 0, "run_id": "run_2", "status": "passed",
+             "cost_usd": 0.002, "latency_ms": 900, "tokens": 300, "finished_at": TS,
+             "verdict": {"run_status": "succeeded",
+                         "checks": [{"type": "tool_call", "passed": True}],
+                         "tool_calls": 2, "sandboxed_calls": 1}},
+            {"case": "chest", "trial": 1, "run_id": None, "status": "error",
+             "verdict": {"error": "quota"}, "finished_at": TS},
+        ],
+    }  # fmt: skip
+    router(admin).get("/tenants/t1/evals/ev_1").respond(200, json=running)
+    e = admin.evals.get("t1", "ev_1")
+    assert not e.done and e.summary is None
+    assert e.trials is not None
+    in_flight, scored, failed = e.trials
+    assert in_flight.pending and in_flight.verdict is None
+    assert not scored.pending and isinstance(scored.verdict, m.GoldenVerdict)
+    assert scored.verdict.checks[0].type == "tool_call"
+    assert (scored.verdict.tool_calls, scored.verdict.sandboxed_calls) == (2, 1)
+    assert not failed.pending and isinstance(failed.verdict, m.TrialError)
+    assert e.scored_trials == 2
+
+
+def test_pending_eval_without_trials_and_unknown_verdicts() -> None:
+    pending = m.Eval.model_validate({**EVAL, "status": "pending", "summary": None})
+    assert not pending.done and pending.scored_trials == 0 and pending.trials is None
+    # A verdict shape this SDK does not know stays a dict instead of failing the eval.
+    trial = m.EvalTrial.model_validate(
+        {"case": "x", "status": "passed", "verdict": {"kind": "future", "ok": True}}
+    )
+    assert trial.verdict == {"kind": "future", "ok": True}
+    assert m.EvalTrial.model_validate({"case": "x"}).pending
+
+
+def test_inconclusive_injection_summary() -> None:
+    e = m.Eval.model_validate(
+        {
+            **EVAL,
+            "suite": "injection",
+            "status": "succeeded",
+            "summary": {
+                "suite": "injection", "suite_version": 3, "trials": 0, "blocked": 0,
+                "pass_rate": None, "attack_success_rate": None, "attacks_succeeded": 0,
+                "errors": 2, "error_kinds": {"quota": 1, "timeout": 1}, "inconclusive": True,
+                "attacked": 0, "utility_under_attack": 0,
+                "by_category": {"tainted_write": {"trials": 0, "blocked": 0, "errors": 2,
+                                                  "pass_rate": None}},
+                "not_applicable": [], "cost_usd": 0, "latency_ms": {"p50": None, "p95": None},
+                "cases": [{"case": "tw-1", "trial": 0, "blocked": False, "outcome": "error",
+                           "error_kind": "quota"}],
+            },
+        }
+    )  # fmt: skip
+    s = e.summary
+    assert isinstance(s, m.InjectionSummary)
+    assert (s.pass_rate, s.attack_success_rate, s.inconclusive) == (None, None, True)
+    assert s.error_kinds == {"quota": 1, "timeout": 1}
+    assert s.by_category["tainted_write"].errors == 2
+    assert (s.cases[0].outcome, s.cases[0].error_kind) == ("error", "quota")
+
+
+def test_golden_case_tool_results_and_tool_call_checks(admin: CalibanAdmin) -> None:
+    case = m.GoldenCase(
+        id="refund-ok",
+        input={"ticket": "refund INV-1"},
+        tool_results={"lookup_invoice": {"id": "INV-1", "amount": 40}},
+        checks=[
+            {"type": "tool_call", "tool": "mcp://bank/refund", "args": {"invoice": "INV-1"}},
+            {"type": "llm_judge", "rubric": "Refunds INV-1", "reference": {"refunded": "INV-1"}},
+        ],
+    )
+    put = router(admin).put("/tenants/t1/nodes/desk/versions/2/golden-set")
+    put.respond(
+        200,
+        json={
+            "object": "node.golden_set", "node": "desk", "version": 2, "hash": "sha256:bb",
+            "case_count": 1, "updated_at": TS, "updated_by": "u", "content_visible": True,
+            "cases": [{**case.to_body(), "tags": ["captured", "good"]}],
+        },
+    )  # fmt: skip
+    got = admin.evals.put_golden_set("t1", "desk", 2, [case])
+    sent = json.loads(put.calls.last.request.content)["cases"][0]
+    assert sent["tool_results"] == {"lookup_invoice": {"id": "INV-1", "amount": 40}}
+    assert got.cases is not None and got.cases[0].tool_results == sent["tool_results"]
+    assert got.cases[0].tags == ["captured", "good"]
+
+
+# ─────────────────── node versions, console runs, golden cases ───────────────────
+
+
+def _version(v: int, state: str, live: bool = False) -> dict[str, object]:
+    return {
+        "id": f"n_{v}",
+        "tenant_id": "t1",
+        "name": "desk",
+        "version": v,
+        "spec": NODE_SPEC,
+        "hash": f"sha256:{v}",
+        "state": state,
+        "live": live,
+        "created_at": TS,
+    }
+
+
+def test_node_versions_create_list_get_summaries(admin: CalibanAdmin) -> None:
+    r = router(admin)
+    create = r.post("/tenants/t1/nodes/desk/versions").respond(201, json=_version(3, "draft"))
+    r.get("/tenants/t1/nodes/desk/versions").respond(
+        200,
+        json={
+            "name": "desk",
+            "live": 2,
+            "promotion": {"version": 2, "promoted_at": TS, "promoted_by": "u"},
+            "versions": [_version(2, "published", True), _version(3, "draft")],
+        },
+    )
+    r.get("/tenants/t1/nodes/desk/versions/3").respond(200, json=_version(3, "draft"))
+    summaries = r.get("/nodes", params={"view": "summary"}).respond(
+        200,
+        json=[
+            {
+                "tenant_id": "t1",
+                "name": "desk",
+                "kind": "agent",
+                "live_version": 2,
+                "latest": {"version": 3, "state": "draft", "hash": "sha256:3"},
+                "versions": 2,
+                "published": 1,
+                "drafts": 1,
+                "retired": 0,
+                "updated_at": TS,
+            }
+        ],
+    )
+
+    draft = admin.nodes.create_version("t1", "desk", NODE_SPEC)
+    assert (draft.version, draft.state, draft.live, draft.hash) == (3, "draft", False, "sha256:3")
+    assert json.loads(create.calls.last.request.content)["spec"]["kind"] == "agent"
+    with pytest.raises(NodeValidationError):
+        admin.nodes.create_version("t1", "desk", {"kind": "agent"})
+    vs = admin.nodes.versions("t1", "desk")
+    assert vs.live == 2 and vs.promotion is not None and vs.promotion.version == 2
+    assert [v.state for v in vs.versions] == ["published", "draft"]
+    assert admin.nodes.get_version("t1", "desk", 3).hash == "sha256:3"
+    s = admin.nodes.summaries(tenant_id="t1")[0]
+    assert (s.live_version, s.latest and s.latest.state, s.drafts) == (2, "draft", 1)
+    assert summaries.calls.last.request.url.params["tenant_id"] == "t1"
+
+
+def test_node_publish_promote_retire_diff(admin: CalibanAdmin) -> None:
+    r = router(admin)
+    publish = r.post("/tenants/t1/nodes/desk/versions/3/publish").respond(
+        200, json=_version(3, "published")
+    )
+    promote = r.post("/tenants/t1/nodes/desk/promote").respond(
+        200, json=_version(3, "published", True)
+    )
+    r.post("/tenants/t1/nodes/desk/versions/1/retire").respond(200, json=_version(1, "retired"))
+    diff = r.get("/tenants/t1/nodes/desk/diff").respond(
+        200,
+        json={
+            "name": "desk",
+            "from": {"version": 2, "hash": "sha256:2", "state": "published"},
+            "to": {"version": 3, "hash": "sha256:3", "state": "draft"},
+            "identical": False,
+            "changes": [{"path": "/prompt/system", "op": "changed", "from": "Old.", "to": "New."}],
+        },
+    )
+
+    assert admin.nodes.publish("t1", "desk", 3, promote=False).live is False
+    assert json.loads(publish.calls.last.request.content) == {"promote": False}
+    admin.nodes.publish("t1", "desk", 3)
+    assert json.loads(publish.calls.last.request.content) == {"promote": True}
+    assert admin.nodes.promote("t1", "desk", 3).live is True
+    assert json.loads(promote.calls.last.request.content) == {"version": 3}
+    assert admin.nodes.retire("t1", "desk", 1).state == "retired"
+    d = admin.nodes.diff("t1", "desk", 2, 3)
+    assert dict(diff.calls.last.request.url.params) == {"from": "2", "to": "3"}
+    assert (d.from_.version, d.to.version, d.identical) == (2, 3, False)
+    assert (d.changes[0].op, d.changes[0].from_, d.changes[0].to) == ("changed", "Old.", "New.")
+
+
+def test_node_promote_refused_by_the_gate(admin: CalibanAdmin) -> None:
+    router(admin).post("/tenants/t1/nodes/desk/promote").respond(
+        422,
+        json={
+            "error": {
+                "message": "promotion bar not met",
+                "type": "invalid_request_error",
+                "problems": [{"kind": "eval_gate", "message": "no injection eval"}],
+            }
+        },
+    )
+    with pytest.raises(UnprocessableEntityError):
+        admin.nodes.promote("t1", "desk", 3)
+
+
+CONSOLE_RUN = {
+    "id": "run_1",
+    "object": "node.run",
+    "node": "desk",
+    "version": 2,
+    "status": "failed",
+    "budget": {"steps_used": 2, "usd": 0.0004},
+    "content_visible": False,
+    "mast_label": "step_repetition",
+    "steps": [
+        {"id": "classify#0", "vertex": "classify", "kind": "llm", "status": "completed",
+         "tokens": 120, "usd": 0.0004, "labels": [], "started_at": TS, "duration_ms": 420},
+        {"id": "agent#1", "vertex": "agent", "kind": "agent", "status": "failed",
+         "tokens": 0, "usd": 0, "labels": ["caller"], "started_at": TS, "duration_ms": 15},
+    ],
+    "created_at": TS,
+}  # fmt: skip
+
+
+def test_console_runs_list_get_input_cancel(admin: CalibanAdmin) -> None:
+    r = router(admin)
+    listed = r.get("/tenants/t1/runs").respond(
+        200,
+        json={
+            "object": "list",
+            "data": [{"id": "run_1", "object": "node.run", "node": "desk", "version": 2,
+                      "status": "failed", "cost_usd": 0.0004, "invoker": "api_key:ab",
+                      "mast_label": "step_repetition", "created_at": TS}],
+            "next_cursor": "c2",
+        },
+    )  # fmt: skip
+    r.get("/tenants/t1/runs/run_1").respond(200, json=CONSOLE_RUN)
+    answer = r.post("/tenants/t1/runs/run_1/input").respond(
+        202, json={**CONSOLE_RUN, "status": "running"}
+    )
+    r.post("/tenants/t1/runs/run_1/cancel").respond(
+        202, json={**CONSOLE_RUN, "status": "running", "cancel_requested": True}
+    )
+
+    page = admin.runs.list(
+        "t1", node="desk", status=["failed", "succeeded"], created_after="2026-10-01T00:00:00Z",
+        limit=5,
+    )  # fmt: skip
+    params = listed.calls.last.request.url.params
+    assert (params["status"], params["limit"], params["created_after"]) == (
+        "failed,succeeded", "5", "2026-10-01T00:00:00Z",
+    )  # fmt: skip
+    assert page.next_cursor == "c2" and page.data[0].mast_label == "step_repetition"
+    run = admin.runs.get("t1", "run_1")
+    assert isinstance(run, m.ConsoleRun) and not run.content_visible
+    assert [s.id for s in run.steps] == ["classify#0", "agent#1"]
+    assert (run.steps[0].duration_ms, run.steps[1].labels) == (420, ["caller"])
+    assert run.mast_label == "step_repetition" and run.done and run.budget.steps_used == 2
+    admin.runs.input("t1", "run_1", {"approve": False}, step="write#0@approve")
+    assert json.loads(answer.calls.last.request.content) == {
+        "answer": {"approve": False},
+        "step": "write#0@approve",
+    }
+    assert admin.runs.cancel("t1", "run_1").cancel_requested
+    with pytest.raises(CalibanError, match="limit"):
+        admin.runs.list("t1", limit=0)
+
+
+CAPTURED = {
+    "object": "node.golden_case",
+    "run_id": "run_1",
+    "node": "desk",
+    "version": 2,
+    "run_version": 2,
+    "case_id": "run_1",
+    "verdict": "bad",
+    "mast_label": "premature_termination",
+    "checks": ["json_schema", "llm_judge"],
+    "previous_hash": "sha256:aa",
+    "golden_set": {"object": "node.golden_set", "node": "desk", "version": 2,
+                   "hash": "sha256:bb", "case_count": 3, "updated_at": TS, "updated_by": "u",
+                   "content_visible": False},
+    "content_visible": False,
+}  # fmt: skip
+
+
+def test_capture_golden_case_good_and_bad(admin: CalibanAdmin) -> None:
+    route = router(admin).post("/tenants/t1/runs/run_1/golden-case")
+    route.side_effect = [
+        httpx.Response(201, json=CAPTURED),
+        httpx.Response(
+            201,
+            json={**CAPTURED, "verdict": "good", "mast_label": None, "content_visible": True,
+                  "checks": ["llm_judge", "tool_call"],
+                  "case": {"id": "run_1", "input": {"q": "x"}, "tags": ["captured", "good"],
+                           "future_field": 1}},
+        ),
+    ]  # fmt: skip
+    bad = admin.runs.capture_golden_case(
+        "t1",
+        "run_1",
+        verdict="bad",
+        note="It must ask for the invoice number before refunding.",
+        mast_label="premature_termination",
+    )
+    assert json.loads(route.calls[0].request.content) == {
+        "verdict": "bad",
+        "note": "It must ask for the invoice number before refunding.",
+        "mast_label": "premature_termination",
+    }
+    assert (bad.case_id, bad.golden_set.hash, bad.case) == ("run_1", "sha256:bb", None)
+    good = admin.runs.capture_golden_case("t1", "run_1", verdict="good", version=2)
+    assert json.loads(route.calls[1].request.content) == {"verdict": "good", "version": 2}
+    assert good.case is not None and good.case.tags == ["captured", "good"]
+    assert good.checks == ["llm_judge", "tool_call"]
+
+
+def test_capture_golden_case_checked_before_sending(admin: CalibanAdmin) -> None:
+    route = router(admin).post("/tenants/t1/runs/run_1/golden-case").respond(201, json=CAPTURED)
+    with pytest.raises(CalibanError, match="needs a note"):
+        admin.runs.capture_golden_case("t1", "run_1", verdict="bad")
+    with pytest.raises(CalibanError, match="MAST label"):
+        admin.runs.capture_golden_case("t1", "run_1", verdict="good", mast_label="step_repetition")
+    with pytest.raises(ValueError, match="mast_label"):
+        admin.runs.capture_golden_case(
+            "t1",
+            "run_1",
+            verdict="bad",
+            note="x",
+            mast_label="bad_vibes",  # type: ignore[arg-type]
+        )
+    assert route.call_count == 0
+
+
+def test_capture_golden_case_conflict_and_no_retry_on_502(admin: CalibanAdmin) -> None:
+    route = router(admin).post("/tenants/t1/runs/run_1/golden-case")
+    conflict = {"error": {"message": "the run has not finished", "type": "conflict"}}
+    route.side_effect = [httpx.Response(502), httpx.Response(409, json=conflict)]
+    with pytest.raises(UpstreamError):
+        admin.runs.capture_golden_case("t1", "run_1", verdict="good")
+    assert route.call_count == 1
+    with pytest.raises(ConflictError, match="not finished"):
+        admin.runs.capture_golden_case("t1", "run_1", verdict="good")
+
+
+def test_inbox(admin: CalibanAdmin) -> None:
+    router(admin).get("/tenants/t1/inbox").respond(
+        200,
+        json={
+            "object": "list",
+            "content_visible": True,
+            "data": [
+                {
+                    "run_id": "run_1",
+                    "node": "desk",
+                    "version": 2,
+                    "step": "write#0@approve",
+                    "kind": "approval",
+                    "question": "Allow erp/approve?",
+                    "waiting_since": TS,
+                    "expires_at": None,
+                    "approval": {
+                        "tool": "mcp://erp/approve#sha256:ab",
+                        "effect": "write",
+                        "labels": ["caller"],
+                        "arguments": {"invoice": "INV-1"},
+                    },
+                }
+            ],
+        },
+    )
+    item = admin.inbox.list("t1").data[0]
+    assert item.kind == "approval" and item.approval is not None
+    assert (item.approval.labels, item.approval.arguments) == (["caller"], {"invoice": "INV-1"})
