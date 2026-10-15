@@ -16,6 +16,7 @@ from caliban import (
     ConflictError,
     NotFoundError,
     OntologyBreakingChangeError,
+    UnprocessableEntityError,
     UpstreamError,
 )
 from caliban.admin import models as m
@@ -1840,3 +1841,284 @@ def test_golden_case_tool_results_and_tool_call_checks(admin: CalibanAdmin) -> N
     assert sent["tool_results"] == {"lookup_invoice": {"id": "INV-1", "amount": 40}}
     assert got.cases is not None and got.cases[0].tool_results == sent["tool_results"]
     assert got.cases[0].tags == ["captured", "good"]
+
+
+# ─────────────────── node versions, console runs, golden cases ───────────────────
+
+
+def _version(v: int, state: str, live: bool = False) -> dict[str, object]:
+    return {
+        "id": f"n_{v}",
+        "tenant_id": "t1",
+        "name": "desk",
+        "version": v,
+        "spec": NODE_SPEC,
+        "hash": f"sha256:{v}",
+        "state": state,
+        "live": live,
+        "created_at": TS,
+    }
+
+
+def test_node_versions_create_list_get_summaries(admin: CalibanAdmin) -> None:
+    r = router(admin)
+    create = r.post("/tenants/t1/nodes/desk/versions").respond(201, json=_version(3, "draft"))
+    r.get("/tenants/t1/nodes/desk/versions").respond(
+        200,
+        json={
+            "name": "desk",
+            "live": 2,
+            "promotion": {"version": 2, "promoted_at": TS, "promoted_by": "u"},
+            "versions": [_version(2, "published", True), _version(3, "draft")],
+        },
+    )
+    r.get("/tenants/t1/nodes/desk/versions/3").respond(200, json=_version(3, "draft"))
+    summaries = r.get("/nodes", params={"view": "summary"}).respond(
+        200,
+        json=[
+            {
+                "tenant_id": "t1",
+                "name": "desk",
+                "kind": "agent",
+                "live_version": 2,
+                "latest": {"version": 3, "state": "draft", "hash": "sha256:3"},
+                "versions": 2,
+                "published": 1,
+                "drafts": 1,
+                "retired": 0,
+                "updated_at": TS,
+            }
+        ],
+    )
+
+    draft = admin.nodes.create_version("t1", "desk", NODE_SPEC)
+    assert (draft.version, draft.state, draft.live, draft.hash) == (3, "draft", False, "sha256:3")
+    assert json.loads(create.calls.last.request.content)["spec"]["kind"] == "agent"
+    with pytest.raises(NodeValidationError):
+        admin.nodes.create_version("t1", "desk", {"kind": "agent"})
+    vs = admin.nodes.versions("t1", "desk")
+    assert vs.live == 2 and vs.promotion is not None and vs.promotion.version == 2
+    assert [v.state for v in vs.versions] == ["published", "draft"]
+    assert admin.nodes.get_version("t1", "desk", 3).hash == "sha256:3"
+    s = admin.nodes.summaries(tenant_id="t1")[0]
+    assert (s.live_version, s.latest and s.latest.state, s.drafts) == (2, "draft", 1)
+    assert summaries.calls.last.request.url.params["tenant_id"] == "t1"
+
+
+def test_node_publish_promote_retire_diff(admin: CalibanAdmin) -> None:
+    r = router(admin)
+    publish = r.post("/tenants/t1/nodes/desk/versions/3/publish").respond(
+        200, json=_version(3, "published")
+    )
+    promote = r.post("/tenants/t1/nodes/desk/promote").respond(
+        200, json=_version(3, "published", True)
+    )
+    r.post("/tenants/t1/nodes/desk/versions/1/retire").respond(200, json=_version(1, "retired"))
+    diff = r.get("/tenants/t1/nodes/desk/diff").respond(
+        200,
+        json={
+            "name": "desk",
+            "from": {"version": 2, "hash": "sha256:2", "state": "published"},
+            "to": {"version": 3, "hash": "sha256:3", "state": "draft"},
+            "identical": False,
+            "changes": [{"path": "/prompt/system", "op": "changed", "from": "Old.", "to": "New."}],
+        },
+    )
+
+    assert admin.nodes.publish("t1", "desk", 3, promote=False).live is False
+    assert json.loads(publish.calls.last.request.content) == {"promote": False}
+    admin.nodes.publish("t1", "desk", 3)
+    assert json.loads(publish.calls.last.request.content) == {"promote": True}
+    assert admin.nodes.promote("t1", "desk", 3).live is True
+    assert json.loads(promote.calls.last.request.content) == {"version": 3}
+    assert admin.nodes.retire("t1", "desk", 1).state == "retired"
+    d = admin.nodes.diff("t1", "desk", 2, 3)
+    assert dict(diff.calls.last.request.url.params) == {"from": "2", "to": "3"}
+    assert (d.from_.version, d.to.version, d.identical) == (2, 3, False)
+    assert (d.changes[0].op, d.changes[0].from_, d.changes[0].to) == ("changed", "Old.", "New.")
+
+
+def test_node_promote_refused_by_the_gate(admin: CalibanAdmin) -> None:
+    router(admin).post("/tenants/t1/nodes/desk/promote").respond(
+        422,
+        json={
+            "error": {
+                "message": "promotion bar not met",
+                "type": "invalid_request_error",
+                "problems": [{"kind": "eval_gate", "message": "no injection eval"}],
+            }
+        },
+    )
+    with pytest.raises(UnprocessableEntityError):
+        admin.nodes.promote("t1", "desk", 3)
+
+
+CONSOLE_RUN = {
+    "id": "run_1",
+    "object": "node.run",
+    "node": "desk",
+    "version": 2,
+    "status": "failed",
+    "budget": {"steps_used": 2, "usd": 0.0004},
+    "content_visible": False,
+    "mast_label": "step_repetition",
+    "steps": [
+        {"id": "classify#0", "vertex": "classify", "kind": "llm", "status": "completed",
+         "tokens": 120, "usd": 0.0004, "labels": [], "started_at": TS, "duration_ms": 420},
+        {"id": "agent#1", "vertex": "agent", "kind": "agent", "status": "failed",
+         "tokens": 0, "usd": 0, "labels": ["caller"], "started_at": TS, "duration_ms": 15},
+    ],
+    "created_at": TS,
+}  # fmt: skip
+
+
+def test_console_runs_list_get_input_cancel(admin: CalibanAdmin) -> None:
+    r = router(admin)
+    listed = r.get("/tenants/t1/runs").respond(
+        200,
+        json={
+            "object": "list",
+            "data": [{"id": "run_1", "object": "node.run", "node": "desk", "version": 2,
+                      "status": "failed", "cost_usd": 0.0004, "invoker": "api_key:ab",
+                      "mast_label": "step_repetition", "created_at": TS}],
+            "next_cursor": "c2",
+        },
+    )  # fmt: skip
+    r.get("/tenants/t1/runs/run_1").respond(200, json=CONSOLE_RUN)
+    answer = r.post("/tenants/t1/runs/run_1/input").respond(
+        202, json={**CONSOLE_RUN, "status": "running"}
+    )
+    r.post("/tenants/t1/runs/run_1/cancel").respond(
+        202, json={**CONSOLE_RUN, "status": "running", "cancel_requested": True}
+    )
+
+    page = admin.runs.list(
+        "t1", node="desk", status=["failed", "succeeded"], created_after="2026-10-01T00:00:00Z",
+        limit=5,
+    )  # fmt: skip
+    params = listed.calls.last.request.url.params
+    assert (params["status"], params["limit"], params["created_after"]) == (
+        "failed,succeeded", "5", "2026-10-01T00:00:00Z",
+    )  # fmt: skip
+    assert page.next_cursor == "c2" and page.data[0].mast_label == "step_repetition"
+    run = admin.runs.get("t1", "run_1")
+    assert isinstance(run, m.ConsoleRun) and not run.content_visible
+    assert [s.id for s in run.steps] == ["classify#0", "agent#1"]
+    assert (run.steps[0].duration_ms, run.steps[1].labels) == (420, ["caller"])
+    assert run.mast_label == "step_repetition" and run.done and run.budget.steps_used == 2
+    admin.runs.input("t1", "run_1", {"approve": False}, step="write#0@approve")
+    assert json.loads(answer.calls.last.request.content) == {
+        "answer": {"approve": False},
+        "step": "write#0@approve",
+    }
+    assert admin.runs.cancel("t1", "run_1").cancel_requested
+    with pytest.raises(CalibanError, match="limit"):
+        admin.runs.list("t1", limit=0)
+
+
+CAPTURED = {
+    "object": "node.golden_case",
+    "run_id": "run_1",
+    "node": "desk",
+    "version": 2,
+    "run_version": 2,
+    "case_id": "run_1",
+    "verdict": "bad",
+    "mast_label": "premature_termination",
+    "checks": ["json_schema", "llm_judge"],
+    "previous_hash": "sha256:aa",
+    "golden_set": {"object": "node.golden_set", "node": "desk", "version": 2,
+                   "hash": "sha256:bb", "case_count": 3, "updated_at": TS, "updated_by": "u",
+                   "content_visible": False},
+    "content_visible": False,
+}  # fmt: skip
+
+
+def test_capture_golden_case_good_and_bad(admin: CalibanAdmin) -> None:
+    route = router(admin).post("/tenants/t1/runs/run_1/golden-case")
+    route.side_effect = [
+        httpx.Response(201, json=CAPTURED),
+        httpx.Response(
+            201,
+            json={**CAPTURED, "verdict": "good", "mast_label": None, "content_visible": True,
+                  "checks": ["llm_judge", "tool_call"],
+                  "case": {"id": "run_1", "input": {"q": "x"}, "tags": ["captured", "good"],
+                           "future_field": 1}},
+        ),
+    ]  # fmt: skip
+    bad = admin.runs.capture_golden_case(
+        "t1",
+        "run_1",
+        verdict="bad",
+        note="It must ask for the invoice number before refunding.",
+        mast_label="premature_termination",
+    )
+    assert json.loads(route.calls[0].request.content) == {
+        "verdict": "bad",
+        "note": "It must ask for the invoice number before refunding.",
+        "mast_label": "premature_termination",
+    }
+    assert (bad.case_id, bad.golden_set.hash, bad.case) == ("run_1", "sha256:bb", None)
+    good = admin.runs.capture_golden_case("t1", "run_1", verdict="good", version=2)
+    assert json.loads(route.calls[1].request.content) == {"verdict": "good", "version": 2}
+    assert good.case is not None and good.case.tags == ["captured", "good"]
+    assert good.checks == ["llm_judge", "tool_call"]
+
+
+def test_capture_golden_case_checked_before_sending(admin: CalibanAdmin) -> None:
+    route = router(admin).post("/tenants/t1/runs/run_1/golden-case").respond(201, json=CAPTURED)
+    with pytest.raises(CalibanError, match="needs a note"):
+        admin.runs.capture_golden_case("t1", "run_1", verdict="bad")
+    with pytest.raises(CalibanError, match="MAST label"):
+        admin.runs.capture_golden_case("t1", "run_1", verdict="good", mast_label="step_repetition")
+    with pytest.raises(ValueError, match="mast_label"):
+        admin.runs.capture_golden_case(
+            "t1",
+            "run_1",
+            verdict="bad",
+            note="x",
+            mast_label="bad_vibes",  # type: ignore[arg-type]
+        )
+    assert route.call_count == 0
+
+
+def test_capture_golden_case_conflict_and_no_retry_on_502(admin: CalibanAdmin) -> None:
+    route = router(admin).post("/tenants/t1/runs/run_1/golden-case")
+    conflict = {"error": {"message": "the run has not finished", "type": "conflict"}}
+    route.side_effect = [httpx.Response(502), httpx.Response(409, json=conflict)]
+    with pytest.raises(UpstreamError):
+        admin.runs.capture_golden_case("t1", "run_1", verdict="good")
+    assert route.call_count == 1
+    with pytest.raises(ConflictError, match="not finished"):
+        admin.runs.capture_golden_case("t1", "run_1", verdict="good")
+
+
+def test_inbox(admin: CalibanAdmin) -> None:
+    router(admin).get("/tenants/t1/inbox").respond(
+        200,
+        json={
+            "object": "list",
+            "content_visible": True,
+            "data": [
+                {
+                    "run_id": "run_1",
+                    "node": "desk",
+                    "version": 2,
+                    "step": "write#0@approve",
+                    "kind": "approval",
+                    "question": "Allow erp/approve?",
+                    "waiting_since": TS,
+                    "expires_at": None,
+                    "approval": {
+                        "tool": "mcp://erp/approve#sha256:ab",
+                        "effect": "write",
+                        "labels": ["caller"],
+                        "arguments": {"invoice": "INV-1"},
+                    },
+                }
+            ],
+        },
+    )
+    item = admin.inbox.list("t1").data[0]
+    assert item.kind == "approval" and item.approval is not None
+    assert (item.approval.labels, item.approval.arguments) == (["caller"], {"invoice": "INV-1"})

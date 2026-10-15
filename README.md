@@ -289,9 +289,13 @@ print(admin.usage.get(tenant_id=t.id, limit=100).totals)
 | `ontology` | `get`, `review`, `approve`, `reject`, `deprecate`, `review_batch`, `propose` |
 | `intents` | `list`, `put` (`set` is a deprecated alias), `delete` (the tenant's `caliban/auto` exemplars) |
 | `rag` | `models`, `collections.list`, `.create`, `.get`, `.delete`, `documents.list`, `.ingest`, `.get`, `.delete`, `.release` |
-| `nodes` | `list`, `create` (validates `spec` locally first; `validate_spec=False` skips that), `delete` |
+| `nodes` | `list`, `summaries`, `create` (validates `spec` locally first; `validate_spec=False` skips that), `versions`, `get_version`, `create_version`, `publish`, `promote`, `retire`, `diff`, `delete` (see [Node versions](#node-versions-publish-and-make-live)) |
+| `runs` | `list`, `get`, `input`, `cancel`, `capture_golden_case` (a tenant's node runs, as the console sees them) |
+| `inbox` | `list` (runs waiting for a human) |
 | `evals` | `get_golden_set`, `put_golden_set`, `delete_golden_set`, `get_policy`, `set_policy`, `start`, `list`, `get`, `cancel`, `wait`, `gate`, `get_key`, `rotate_key` (see [Server-side evals](#server-side-evals-and-the-promotion-gate)) |
 | `usage` | `get` (`limit` between 1 and 1000), `node_spend` (node spend today and this month against the tenant's caps) |
+
+Tool servers, routes, the audit log, KEK status, roles, users and role bindings have no helper yet.
 
 The constructor takes `token`, `base_url`, `timeout` (default 30 s), `max_retries`, `default_headers` and `http_client`. GET and DELETE requests retry on 429, 502 and 503. POST and PATCH requests retry only on 429 and 503, because a 502 may mean the server already acted (see [Retries](#retries)). The response models live in `caliban.admin.models`.
 
@@ -437,6 +441,65 @@ revoked = [k for k in admin.api_keys.list(other_id, include_revoked=True) if k.r
 - A deleted tenant's id cannot be reused, and every tenant-scoped call for it raises `NotFoundError`.
 - A standalone deployment rejects a revoked key on the next request. A split-mode router stops accepting it after its next snapshot poll (`CALIBAN_SNAPSHOT_POLL_SECS`, 10 s by default).
 - `Tenant` has `status` (`"active"` or `"deleted"`) and `deleted_at`; `ApiKeyInfo` has `revoked_at`. They are optional and `None` when an older server omits them.
+
+#### Node versions: publish and make live
+
+A node version is created as a `draft`, published (validated against the tenant, sealed and shipped to routers and workers), made live, and eventually retired. Versions are immutable: a change is a new version. `live` marks the version the promotion pointer names: what a run without a version, and `model="node/<name>"`, run.
+
+```python
+draft = admin.nodes.create_version(t.id, "desk", load_node("desk.yaml"))  # state="draft"
+
+# "Go live": publish without promoting, evaluate, check the gate, then promote.
+admin.nodes.publish(t.id, "desk", draft.version, promote=False)
+for suite in ("golden", "injection"):
+    e = admin.evals.start(t.id, "desk", draft.version, suite=suite)
+    admin.evals.wait(t.id, e.id, timeout_s=1800)
+if admin.evals.gate(t.id, "desk", draft.version).allowed:
+    admin.nodes.promote(t.id, "desk", draft.version)  # live=True
+
+versions = admin.nodes.versions(t.id, "desk")  # oldest first; versions.live is the live one
+admin.nodes.promote(t.id, "desk", 2)  # roll back
+for c in admin.nodes.diff(t.id, "desk", 2, 3).changes:
+    print(c.op, c.path)  # JSON pointers into the spec
+admin.nodes.retire(t.id, "desk", 1)  # final; runs already started finish on it
+print([(n.name, n.live_version) for n in admin.nodes.summaries(tenant_id=t.id)])
+```
+
+- `publish` promotes by default. A version with write tools, or a node with a golden bar, cannot be promoted as a draft (it has no evals yet): that raises `UnprocessableEntityError` (problems of kind `eval_gate`). Publish it with `promote=False`, run its evals, then `promote`.
+- `promote` checks the version's budgets against the tenant's `node_caps` and its latest finished evals against the promotion bar, its pinned subnodes' too; `evals.gate` gives the same answer in advance. A draft or a retired version raises `ConflictError`.
+- `retire` is final. A version another published version still calls (`node://`) raises `ConflictError`.
+- `nodes.create(tenant_id=..., name=..., spec=...)` is `create_version` with the tenant and name in the body.
+
+#### Node runs, the inbox, and saving a run as a test
+
+`admin.runs` sees a tenant's node runs as the console does. `list` (filters `node`, `status`, `created_after`, `created_before`; pages with `cursor`) and `get` need `runs.read`; content (`input`, `output`, step outputs, the question) comes only with `runs.data` (`content_visible`). A `ConsoleRun`'s `steps` are its timeline (`RunStep`: id, vertex, kind, status, tokens, `usd`, `started_at`, `duration_ms`), next to its `budget`, `cost_usd` (billed), `model_cost_usd` (the routed models' real cost) and `answer_check`. `input` and `cancel` need `runs.answer` and are audited with the caller's identity. `admin.inbox.list(tenant_id)` lists the runs waiting for a human, oldest wait first; an approval carries `approval` (the tool, its effect, the taint labels of its arguments, and the `arguments` with `runs.data`).
+
+```python
+for item in admin.inbox.list(t.id).data:
+    if item.kind == "approval" and item.approval:
+        ok = all(label == "datasource" for label in item.approval.labels)
+        admin.runs.input(t.id, item.run_id, {"approve": ok}, step=item.step)
+
+run = admin.runs.get(t.id, run_id)
+for step in run.steps:
+    print(step.started_at, step.id, step.status, step.duration_ms, step.usd)
+```
+
+**Save a run as a test.** `runs.capture_golden_case(tenant_id, run_id, verdict=...)` turns a finished run into a case of its version's golden set (`nodes.write`), so production feedback feeds the eval loop. The case id is the run id; it takes the run's input and its human answers. `verdict="good"` (the run must have succeeded) adds an `llm_judge` check with the run's output as `reference` and a `tool_call` check for each write it made. `verdict="bad"` needs a `note`, which becomes the judge's rubric, and may carry a `mast_label` (a MAST failure mode, `MastLabel`), stored on the run too (`mast_label` on `runs.get` and `runs.list`).
+
+```python
+admin.runs.capture_golden_case(t.id, good_run_id, verdict="good")
+c = admin.runs.capture_golden_case(
+    t.id,
+    bad_run_id,
+    verdict="bad",
+    note="It must ask for the invoice number before refunding.",
+    mast_label="premature_termination",
+)
+print(c.case_id, c.checks, c.golden_set.hash)  # c.case with runs.data
+```
+
+`bad` without a note and a label on `good` raise `CalibanError` before anything is sent. The server raises `ConflictError` when the run has not finished, is already in the set, or the set kept changing (the capture is a compare-and-set on the set's hash), and `UnprocessableEntityError` for `good` on a run that did not succeed or an injection-suite run. Like any POST it is not retried on 502.
 
 ### Open models on-prem
 
@@ -638,7 +701,8 @@ admin.evals.set_policy(
     injection={"min_pass_rate": 1.0},
 )
 
-# The version is published with {"promote": false}, evaluated, then promoted.
+# The version is published with promote=False, evaluated, then promoted
+# (see Node versions above).
 for suite in ("golden", "injection"):
     e = admin.evals.start("acme", "triage", 3, suite=suite)
     e = admin.evals.wait("acme", e.id, timeout_s=1800)

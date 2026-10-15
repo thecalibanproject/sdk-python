@@ -14,14 +14,30 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ..errors import CalibanError
 from ..evals.dataset import Case
-from ..types import CacheTier, ModelCapabilities, ModelKind, RouteStage, TrustTier
+from ..types import (
+    AnswerCheck,
+    CacheTier,
+    MastLabel,
+    ModelCapabilities,
+    ModelKind,
+    NodeRun,
+    NodeRunList,
+    NodeRunSummary,
+    RouteStage,
+    RunStatus,
+    RunStep,
+    TrustTier,
+)
 
 __all__ = [
+    "AnswerCheck",
     "ApiKeyCreate",
     "ApiKeyCreated",
     "ApiKeyInfo",
     "ApiKeyUpdate",
     "CacheTier",
+    "CapturedGoldenCase",
+    "ConsoleRun",
     "Datasource",
     "DatasourceCreate",
     "DatasourceKind",
@@ -42,6 +58,7 @@ __all__ = [
     "GateEvidence",
     "GoldenBar",
     "GoldenCase",
+    "GoldenCaseCapture",
     "GoldenCaseSummary",
     "GoldenEvidence",
     "GoldenSet",
@@ -49,6 +66,9 @@ __all__ = [
     "GoldenSummary",
     "GoldenVerdict",
     "Health",
+    "Inbox",
+    "InboxApproval",
+    "InboxItem",
     "InjectionBar",
     "InjectionCaseResult",
     "InjectionCategory",
@@ -65,6 +85,7 @@ __all__ = [
     "IntrospectionStatus",
     "JudgeInfo",
     "LatencyPercentiles",
+    "MastLabel",
     "Model",
     "ModelCapabilities",
     "ModelCreate",
@@ -73,10 +94,22 @@ __all__ = [
     "Node",
     "NodeCaps",
     "NodeCreate",
+    "NodeDiff",
+    "NodeDiffChange",
+    "NodeDiffSide",
+    "NodeLatest",
+    "NodePromotion",
     "NodeRoute",
+    "NodeRun",
+    "NodeRunList",
+    "NodeRunSummary",
     "NodeSpend",
     "NodeSpendAmounts",
     "NodeSpendCaps",
+    "NodeState",
+    "NodeSummary",
+    "NodeVersions",
+    "NodeWarning",
     "NotApplicable",
     "Ontology",
     "OntologyBatchReview",
@@ -116,6 +149,7 @@ __all__ = [
     "RagTrust",
     "RouteStage",
     "RunStatus",
+    "RunStep",
     "SemanticCacheSetting",
     "SharedProvider",
     "SharedProviderCreate",
@@ -187,16 +221,6 @@ EvalSuite = Literal["golden", "injection"]
 InjectionReadOnly = Literal["required", "optional"]
 EvalStatus = Literal["pending", "running", "succeeded", "failed", "cancelled"]
 EvalTrialStatus = Literal["running", "passed", "failed", "error"]
-RunStatus = Literal[
-    "pending",
-    "running",
-    "sleeping",
-    "input_required",
-    "succeeded",
-    "failed",
-    "budget_exhausted",
-    "cancelled",
-]
 InjectionCategoryName = Literal[
     "tainted_write",
     "exfiltration",
@@ -878,13 +902,104 @@ class RagDocumentVersions(_Response):
     versions: list[RagDocument]
 
 
+NodeState = Literal["draft", "published", "retired"]
+
+
+class NodeWarning(_Response):
+    """A broad ``allow_tainted`` entry: standing authority for tainted writes (a warning,
+    not a refusal)."""
+
+    kind: str
+    message: str
+    path: str | None = None
+    """e.g. ``tools[1].allow_tainted[0]``."""
+
+
 class Node(_Response):
+    """One immutable node version (``components.schemas.Node``)."""
+
     id: str
+    """Record id (``nodes.delete(tenant_id, id)``)."""
     tenant_id: str
     name: str
     version: int
     spec: dict[str, Any]
+    hash: str | None = None
+    """``sha256:<hex>`` over the canonical spec JSON."""
+    state: NodeState | None = None
+    """``draft``, ``published`` or ``retired``. ``None`` from older servers."""
+    live: bool | None = None
+    """The promotion pointer names this version: what a run without a version runs."""
     created_at: datetime
+    created_by: str | None = None
+    published_at: datetime | None = None
+    retired_at: datetime | None = None
+    warnings: list[NodeWarning] | None = None
+
+
+class NodeLatest(_Response):
+    version: int
+    state: NodeState
+    hash: str
+
+
+class NodeSummary(_Response):
+    """One entry per node (``nodes.summaries``; ``components.schemas.NodeSummary``)."""
+
+    tenant_id: str
+    name: str
+    description: str | None = None
+    """The latest version's ``description``."""
+    kind: Literal["workflow", "agent"] | None = None
+    live_version: int | None = None
+    latest: NodeLatest | None = None
+    versions: int
+    """Versions not deleted."""
+    published: int
+    drafts: int
+    retired: int
+    updated_at: datetime | None = None
+    """The last creation, publication, retirement or promotion."""
+
+
+class NodePromotion(_Response):
+    version: int
+    promoted_at: datetime | None = None
+    promoted_by: str | None = None
+
+
+class NodeVersions(_Response):
+    """``nodes.versions``: every version not deleted, oldest first, and the live one."""
+
+    name: str
+    live: int | None = None
+    """The promoted version; ``None`` when none is."""
+    promotion: NodePromotion | None = None
+    versions: list[Node]
+
+
+class NodeDiffSide(_Response):
+    version: int
+    hash: str | None = None
+    state: str | None = None
+
+
+class NodeDiffChange(_Response):
+    path: str
+    """A JSON pointer into the spec."""
+    op: Literal["added", "removed", "changed"]
+    from_: Any = Field(default=None, alias="from")
+    to: Any = None
+
+
+class NodeDiff(_Response):
+    """``nodes.diff``: two versions' hashes and a structural diff of their specs."""
+
+    name: str
+    from_: NodeDiffSide = Field(alias="from")
+    to: NodeDiffSide
+    identical: bool
+    changes: list[NodeDiffChange] = Field(default_factory=list)
 
 
 class NodeCreate(_Request):
@@ -1515,3 +1630,98 @@ class EvalKeyRotation(_Response):
     key: ApiKeyInfo
     revoked: str | None = None
     """The id of the key it replaced."""
+
+
+# ───────────────────────────── runs (console) ─────────────────────────────
+
+
+class ConsoleRun(NodeRun):
+    """A run as the console sees it (``components.schemas.ConsoleRun``). Content
+    (``input``, ``output``, step outputs, the question) only with ``runs.data``
+    (``content_visible``). ``steps`` is the run's timeline."""
+
+    invoker: str | None = None
+    content_visible: bool = False
+    input: Any = None
+    """With ``runs.data``."""
+    mast_label: MastLabel | str | None = None
+    """The MAST failure mode a reviewer labelled the run with when capturing it as ``bad``."""
+
+
+class GoldenCaseCapture(_Request):
+    """Body of ``POST .../runs/{runId}/golden-case``."""
+
+    verdict: Literal["good", "bad"]
+    """``good``: the run did the right thing (it must have succeeded). ``bad``: it did not."""
+    note: str | None = None
+    """What the right behaviour is. Required for ``bad`` (the judge's rubric); added to the
+    rubric for ``good``."""
+    mast_label: MastLabel | None = None
+    """Bad runs only."""
+    version: int | None = Field(default=None, ge=1)
+    """The version whose golden set receives the case (default: the run's)."""
+
+
+class CapturedGoldenCase(_Response):
+    """A run turned into a golden case (``components.schemas.CapturedGoldenCase``)."""
+
+    object: str = "node.golden_case"
+    run_id: str
+    node: str
+    version: int
+    """The version whose golden set holds the case."""
+    run_version: int
+    case_id: str
+    """The run id."""
+    verdict: Literal["good", "bad"]
+    mast_label: MastLabel | str | None = None
+    checks: list[str]
+    """The kinds of the checks derived from the run (``json_schema``, ``llm_judge``,
+    ``tool_call``)."""
+    previous_hash: str | None = None
+    """The set's hash before the capture (``None``: it was created)."""
+    golden_set: GoldenSet
+    content_visible: bool
+    case: GoldenCase | None = None
+    """With ``runs.data``."""
+
+    @field_validator("case", mode="before")
+    @classmethod
+    def _drop_unknown_case_keys(cls, v: Any) -> Any:
+        return _known_keys(GoldenCase, v)
+
+
+class InboxApproval(_Response):
+    """What a gated call would do."""
+
+    tool: str | None = None
+    """The tool reference (``mcp://server/tool#sha256:...``)."""
+    effect: str | None = None
+    labels: list[str] = Field(default_factory=list)
+    """The untrusted taint labels its arguments carry."""
+    arguments: Any = None
+    """With ``runs.data``."""
+
+
+class InboxItem(_Response):
+    """A human step a run waits for: a ``question``, or an ``approval`` of a gated call."""
+
+    run_id: str
+    node: str
+    version: int
+    step: str
+    kind: Literal["question", "approval"]
+    question: str | None = None
+    invoker: str | None = None
+    waiting_since: datetime
+    expires_at: datetime | None = None
+    """When the human step times out."""
+    approval: InboxApproval | None = None
+
+
+class Inbox(_Response):
+    """``inbox.list``: runs waiting for a human, oldest wait first."""
+
+    object: str = "list"
+    content_visible: bool
+    data: list[InboxItem]

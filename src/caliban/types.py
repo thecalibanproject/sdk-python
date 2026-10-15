@@ -9,11 +9,13 @@ from __future__ import annotations
 import math
 import re
 from collections.abc import Mapping
+from datetime import datetime
 from typing import Annotated, Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
 __all__ = [
+    "TERMINAL_RUN_STATUSES",
     "AnswerCheck",
     "AnswerCheckAction",
     "AnswerCheckFinding",
@@ -34,11 +36,15 @@ __all__ = [
     "Embedding",
     "EmbeddingUsage",
     "IntentDecision",
+    "MastLabel",
     "Model",
     "ModelCalibanInfo",
     "ModelCapabilities",
     "ModelKind",
     "ModelList",
+    "NodeRun",
+    "NodeRunList",
+    "NodeRunSummary",
     "PiiMode",
     "ReasoningEffort",
     "RerankDocument",
@@ -47,6 +53,12 @@ __all__ = [
     "RerankUsage",
     "Role",
     "RouteStage",
+    "RunAwaiting",
+    "RunBudget",
+    "RunStatus",
+    "RunStep",
+    "RunUsage",
+    "ServerTimingEntry",
     "TrustTier",
     "Untrusted",
 ]
@@ -577,3 +589,177 @@ class RerankResponse(_WithMeta):
     model: str
     results: list[RerankResult]
     usage: RerankUsage | None = None
+
+
+# ───────────────────────────── node runs ─────────────────────────────
+
+RunStatus = Literal[
+    "pending",
+    "running",
+    "sleeping",
+    "input_required",
+    "succeeded",
+    "failed",
+    "budget_exhausted",
+    "cancelled",
+]
+TERMINAL_RUN_STATUSES: frozenset[str] = frozenset(
+    {"succeeded", "failed", "budget_exhausted", "cancelled"}
+)
+"""Statuses a run never leaves."""
+MastLabel = Literal[
+    "disobey_task_specification",
+    "disobey_role_specification",
+    "step_repetition",
+    "loss_of_conversation_history",
+    "unaware_of_termination_conditions",
+    "conversation_reset",
+    "fail_to_ask_for_clarification",
+    "task_derailment",
+    "information_withholding",
+    "ignored_other_agent_input",
+    "reasoning_action_mismatch",
+    "premature_termination",
+    "no_or_incomplete_verification",
+    "incorrect_verification",
+]
+"""A MAST failure mode (arXiv 2503.13657) a reviewer labels a bad run with: FM-1.1 to FM-1.5
+(specification), FM-2.1 to FM-2.6 (inter-agent misalignment), FM-3.1 to FM-3.3 (task
+verification)."""
+
+
+class RunUsage(BaseModel):
+    """Tokens of a run's model calls so far (``components.schemas.RunUsage``)."""
+
+    model_config = ConfigDict(extra="allow")
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    pii_entities: int | None = None
+    """Personal-data entities the gateway protected in the run's model calls."""
+
+
+class RunStep(BaseModel):
+    """One step of a run's timeline (``components.schemas.RunStep``)."""
+
+    model_config = ConfigDict(extra="allow")
+    id: str
+    """Deterministic step id, e.g. ``classify#0``, ``fanout#0/3``, ``agent#2.1``."""
+    vertex: str
+    kind: str
+    status: Literal["completed", "failed"] | str
+    tokens: int = 0
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    usd: float = 0.0
+    """What the step's model call is billed."""
+    model_cost_usd: float | None = None
+    """The routed model's real cost (differs from ``usd`` only for ``caliban/auto``)."""
+    pii_entities: int | None = None
+    labels: list[str] = Field(default_factory=list)
+    """Taint labels of the step's output."""
+    started_at: datetime
+    duration_ms: int
+    output: Any = None
+    """Console only, with ``runs.data``: the step's output."""
+
+
+class RunAwaiting(BaseModel):
+    """The human step a run waits for."""
+
+    model_config = ConfigDict(extra="allow")
+    step: str | None = None
+    kind: Literal["question", "approval"] | None = None
+    """Console only: ``question`` or ``approval`` of a gated call."""
+    question: str | None = None
+
+
+class RunBudget(BaseModel):
+    """A run's budget: limits and what it used so far."""
+
+    model_config = ConfigDict(extra="allow")
+    steps_limit: int | None = None
+    steps_used: int | None = None
+    tokens_limit: int | None = None
+    tokens_used: int | None = None
+    wall_clock_ms_limit: int | None = None
+    wall_clock_ms_used: int | None = None
+    """Execution time only (not waiting for a human or a timer)."""
+    usd: float | None = None
+    """Model spend so far, priced like the metering."""
+    usd_limit: float | None = None
+    depth_limit: int | None = None
+    depth_used: int | None = None
+    fanout_limit: int | None = None
+    fanout_used: int | None = None
+
+
+class NodeRun(_WithMeta):
+    """A node run (``components.schemas.NodeRun``). ``steps`` is its timeline, in order."""
+
+    model_config = ConfigDict(extra="allow")
+    id: str
+    object: str = "node.run"
+    node: str
+    version: int
+    hash: str | None = None
+    """Content hash of the version that runs."""
+    status: RunStatus | str
+    output: Any = None
+    """The output; on ``budget_exhausted`` and ``cancelled`` (and ``failed``, when there is
+    one) the partial result."""
+    partial: bool | None = None
+    error: str | None = None
+    stop_reason: str | None = None
+    awaiting: RunAwaiting | None = None
+    budget: RunBudget = Field(default_factory=RunBudget)
+    cost_usd: float | None = None
+    """What the run is billed (for a run ``caliban/auto`` started, the flat auto price)."""
+    model_cost_usd: float | None = None
+    """The real cost of the models its calls were routed to."""
+    answer_check: AnswerCheck | None = None
+    usage: RunUsage | None = None
+    steps: list[RunStep] = Field(default_factory=list)
+    claims: int | None = None
+    origin: str | None = None
+    input_labels: list[str] | None = None
+    """Taint labels the input carries from the start: ``caller`` for untrusted caller data."""
+    cancel_requested: bool | None = None
+    last_event: int | None = None
+    """Number of the run's last event (resume its event stream after it)."""
+    created_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+
+    @property
+    def done(self) -> bool:
+        """The run ended (succeeded, failed, budget_exhausted or cancelled)."""
+        return self.status in TERMINAL_RUN_STATUSES
+
+
+class NodeRunSummary(BaseModel):
+    """A run in a list (``components.schemas.NodeRunSummary``): no content, no steps."""
+
+    model_config = ConfigDict(extra="allow")
+    id: str
+    object: str = "node.run"
+    node: str
+    version: int
+    status: RunStatus | str
+    awaiting_step: str | None = None
+    cost_usd: float = 0.0
+    origin: str | None = None
+    invoker: str | None = None
+    """``api_key:<hash prefix>``."""
+    mast_label: MastLabel | str | None = None
+    created_at: datetime
+    finished_at: datetime | None = None
+
+
+class NodeRunList(BaseModel):
+    """A page of runs, newest first; pass ``next_cursor`` as ``cursor`` for the next one."""
+
+    model_config = ConfigDict(extra="allow")
+    object: str = "list"
+    data: list[NodeRunSummary]
+    next_cursor: str | None = None

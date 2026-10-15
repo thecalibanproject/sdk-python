@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import builtins
 import os
 import time
 import warnings
 from collections.abc import Mapping, Sequence
+from datetime import datetime
 from types import TracebackType
 from typing import Any, Literal, TypeVar
 from urllib.parse import quote
@@ -28,6 +30,8 @@ from .models import (
     ApiKeyCreated,
     ApiKeyInfo,
     ApiKeyUpdate,
+    CapturedGoldenCase,
+    ConsoleRun,
     Datasource,
     DatasourceCreate,
     DatasourceKind,
@@ -43,6 +47,7 @@ from .models import (
     GateCheck,
     GoldenBar,
     GoldenCase,
+    GoldenCaseCapture,
     GoldenSet,
     GoldenSetPut,
     Health,
@@ -50,6 +55,7 @@ from .models import (
     IntentExemplars,
     IntrospectionJob,
     IntrospectJob,
+    MastLabel,
     Model,
     ModelCapabilities,
     ModelCreate,
@@ -58,8 +64,12 @@ from .models import (
     Node,
     NodeCaps,
     NodeCreate,
+    NodeDiff,
+    NodeRunList,
     NodeSpend,
     NodeSpendCaps,
+    NodeSummary,
+    NodeVersions,
     Ontology,
     OntologyBatchReview,
     OntologyDecision,
@@ -87,6 +97,7 @@ from .models import (
     RagDocumentVersions,
     RagModels,
     RagTrust,
+    RunStatus,
     SemanticCacheSetting,
     SharedProvider,
     SharedProviderCreate,
@@ -97,6 +108,9 @@ from .models import (
     TenantUpdate,
     TrustTier,
     UsageReport,
+)
+from .models import (
+    Inbox as InboxList,
 )
 
 __all__ = ["DEFAULT_ADMIN_URL", "CalibanAdmin"]
@@ -849,8 +863,90 @@ class Rag(_Resource):
 
 
 class Nodes(_Resource):
+    """Nodes and their versions.
+
+    A version is created as a ``draft``, published (validated against the tenant, sealed and
+    shipped to routers and workers), made live with :meth:`promote` (or by :meth:`publish`
+    itself), and retired. Versions are immutable: a change is a new version.
+    """
+
+    @staticmethod
+    def _node(tenant_id: str, name: str) -> str:
+        return f"tenants/{_p(tenant_id)}/nodes/{_p(name)}"
+
     def list(self, *, tenant_id: str | None = None) -> list[Node]:
+        """Every version of every node, with its spec."""
         return self._many(Node, self._get("nodes", {"tenant_id": tenant_id}))
+
+    def summaries(self, *, tenant_id: str | None = None) -> builtins.list[NodeSummary]:
+        """One entry per node, without specs: its live version, its latest version and
+        state, version counts and when it last changed."""
+        params = {"tenant_id": tenant_id, "view": "summary"}
+        return self._many(NodeSummary, self._get("nodes", params))
+
+    def versions(self, tenant_id: str, name: str) -> NodeVersions:
+        """Every version of a node not deleted, oldest first, and the ``live`` one
+        (``nodes.read``)."""
+        return self._one(NodeVersions, self._get(f"{self._node(tenant_id, name)}/versions"))
+
+    def get_version(self, tenant_id: str, name: str, version: int) -> Node:
+        """One version, with its spec and content hash."""
+        path = f"{self._node(tenant_id, name)}/versions/{int(version)}"
+        return self._one(Node, self._get(path))
+
+    def create_version(
+        self,
+        tenant_id: str,
+        name: str,
+        spec: NodeSpec | Mapping[str, Any],
+        *,
+        validate_spec: bool = True,
+    ) -> Node:
+        """Create a draft version, numbered the node's latest plus one (``nodes.write``;
+        audited as ``node.create``). ``spec`` is validated locally first, like
+        :meth:`create`; the server checks it again and content-hashes it."""
+        body = {"spec": _spec_body(spec, validate_spec)}
+        return self._one(Node, self._post(f"{self._node(tenant_id, name)}/versions", body))
+
+    def publish(self, tenant_id: str, name: str, version: int, *, promote: bool = True) -> Node:
+        """Publish a draft (``nodes.publish``; audited as ``node.publish``).
+
+        It is validated against the tenant (subnodes, datasource scopes, budgets against
+        ``node_caps``), sealed and shipped in the signed snapshot. With ``promote`` (the
+        default) it also becomes live, which needs the node's promotion bar met: a version
+        with write tools, or a node with a golden bar, is refused
+        (:class:`~caliban.UnprocessableEntityError`, problems of kind ``eval_gate``) since a
+        draft has no evals yet. Publish it with ``promote=False``, run its evals, then
+        :meth:`promote` it. A version that is not a draft raises
+        :class:`~caliban.ConflictError`.
+        """
+        path = f"{self._node(tenant_id, name)}/versions/{int(version)}/publish"
+        return self._one(Node, self._post(path, {"promote": promote}))
+
+    def promote(self, tenant_id: str, name: str, version: int) -> Node:
+        """Make a published version the live one, or roll back to an earlier one
+        (``nodes.publish``; audited as ``node.promote``).
+
+        Its budgets must fit the tenant's ``node_caps`` and its latest finished evals must
+        meet the promotion bar, its pinned subnodes' too
+        (:class:`~caliban.UnprocessableEntityError`; ``admin.evals.gate`` says the same in
+        advance). A draft or a retired version raises :class:`~caliban.ConflictError`.
+        """
+        path = f"{self._node(tenant_id, name)}/promote"
+        return self._one(Node, self._post(path, {"version": int(version)}))
+
+    def retire(self, tenant_id: str, name: str, version: int) -> Node:
+        """Retire a published version, for good (``nodes.publish``). New runs of it are
+        refused; runs already started finish on it. A version another published version
+        still calls (``node://``) raises :class:`~caliban.ConflictError`."""
+        path = f"{self._node(tenant_id, name)}/versions/{int(version)}/retire"
+        return self._one(Node, self._post(path))
+
+    def diff(self, tenant_id: str, name: str, from_version: int, to_version: int) -> NodeDiff:
+        """Two versions' hashes and a structural diff of their specs (JSON pointers; arrays
+        compared index by index)."""
+        params = {"from": int(from_version), "to": int(to_version)}
+        return self._one(NodeDiff, self._get(f"{self._node(tenant_id, name)}/diff", params))
 
     def create(
         self,
@@ -865,12 +961,7 @@ class Nodes(_Resource):
         ``spec`` is validated locally against the node schema first (disable with
         ``validate_spec=False`` to let the server be the only judge).
         """
-        if isinstance(spec, NodeSpec):
-            spec_body = spec.to_dict()
-        elif validate_spec:
-            spec_body = validate(spec).to_dict()
-        else:
-            spec_body = dict(spec)
+        spec_body = _spec_body(spec, validate_spec)
         body = NodeCreate(tenant_id=tenant_id, name=name, spec=spec_body).to_body()
         return self._one(Node, self._post("nodes", body))
 
@@ -880,6 +971,119 @@ class Nodes(_Resource):
         tenant or is already deleted.
         """
         self._delete(f"tenants/{_p(tenant_id)}/nodes/{_p(node_id)}")
+
+
+def _spec_body(spec: NodeSpec | Mapping[str, Any], validate_spec: bool) -> dict[str, Any]:
+    if isinstance(spec, NodeSpec):
+        return spec.to_dict()
+    if validate_spec:
+        return validate(spec).to_dict()
+    return dict(spec)
+
+
+class Runs(_Resource):
+    """A tenant's node runs, as the console sees them (needs a node journal, else
+    :class:`~caliban.ServiceUnavailableError`). Answers and cancellations are recorded with the
+    caller's identity in the audit chain."""
+
+    @staticmethod
+    def _run(tenant_id: str, run_id: str) -> str:
+        return f"tenants/{_p(tenant_id)}/runs/{_p(run_id)}"
+
+    def list(
+        self,
+        tenant_id: str,
+        *,
+        node: str | None = None,
+        status: RunStatus | Sequence[RunStatus] | None = None,
+        created_after: datetime | str | None = None,
+        created_before: datetime | str | None = None,
+        limit: int | None = None,
+        cursor: str | None = None,
+    ) -> NodeRunList:
+        """One page of run summaries, newest first (``runs.read``). Page with ``cursor``
+        (``next_cursor`` of the previous page)."""
+        if limit is not None and not 1 <= limit <= 200:
+            raise CalibanError("limit must be between 1 and 200")
+        params = {
+            "node": node,
+            "status": status if status is None or isinstance(status, str) else ",".join(status),
+            "created_after": _rfc3339(created_after),
+            "created_before": _rfc3339(created_before),
+            "limit": limit,
+            "cursor": cursor,
+        }
+        return self._one(NodeRunList, self._get(f"tenants/{_p(tenant_id)}/runs", params))
+
+    def get(self, tenant_id: str, run_id: str) -> ConsoleRun:
+        """Status, budget, cost (``cost_usd`` billed, ``model_cost_usd`` the routed models'
+        real cost), usage, the answer guard's ``answer_check`` and the step timeline
+        (``steps``) with ``runs.read``; content too with ``runs.data``."""
+        return self._one(ConsoleRun, self._get(self._run(tenant_id, run_id)))
+
+    def input(
+        self, tenant_id: str, run_id: str, answer: Any, *, step: str | None = None
+    ) -> ConsoleRun:
+        """Answer a question, or approve (``{"approve": True}``) or deny
+        (``{"approve": False}``) a gated call (``runs.answer``). ``step`` defaults to the
+        awaited one. Raises :class:`~caliban.ConflictError` if the run is not waiting (or not
+        for ``step``)."""
+        body: dict[str, Any] = {"answer": answer}
+        if step is not None:
+            body["step"] = step
+        return self._one(ConsoleRun, self._post(f"{self._run(tenant_id, run_id)}/input", body))
+
+    def cancel(self, tenant_id: str, run_id: str) -> ConsoleRun:
+        """Cancel a run (``runs.answer``). A waiting run ends at once; a running one stops at
+        its next step (``cancel_requested``). Raises :class:`~caliban.ConflictError` if it
+        already ended otherwise."""
+        return self._one(ConsoleRun, self._post(f"{self._run(tenant_id, run_id)}/cancel"))
+
+    def capture_golden_case(
+        self,
+        tenant_id: str,
+        run_id: str,
+        *,
+        verdict: Literal["good", "bad"],
+        note: str | None = None,
+        mast_label: MastLabel | None = None,
+        version: int | None = None,
+    ) -> CapturedGoldenCase:
+        """Turn a finished run into a golden case: "save this run as a test"
+        (``nodes.write``; audited as ``node.golden_set.capture``).
+
+        The case (its id is the run id) takes the run's input and its human answers.
+        ``verdict="good"`` (the run must have succeeded) adds an ``llm_judge`` check with the
+        run's output as ``reference`` and a ``tool_call`` check per write it made;
+        ``verdict="bad"`` needs a ``note``, which becomes the judge's rubric, and may carry a
+        ``mast_label`` (stored on the run too). ``version`` sends the case to another version
+        of the same node. Raises :class:`~caliban.ConflictError` if the run has not finished,
+        is already in the set, or the set kept changing, and
+        :class:`~caliban.UnprocessableEntityError` for ``good`` on a run that did not succeed,
+        ``bad`` without a note, or a label on ``good``.
+        """
+        if verdict == "bad" and not note:
+            raise CalibanError("a 'bad' capture needs a note: what the right behaviour is")
+        if verdict == "good" and mast_label is not None:
+            raise CalibanError("a MAST label goes on a 'bad' capture only")
+        body = GoldenCaseCapture(
+            verdict=verdict, note=note, mast_label=mast_label, version=version
+        ).to_body()
+        path = f"{self._run(tenant_id, run_id)}/golden-case"
+        return self._one(CapturedGoldenCase, self._post(path, body))
+
+
+class Inbox(_Resource):
+    """Runs waiting for a human: questions and approvals of gated calls."""
+
+    def list(self, tenant_id: str) -> InboxList:
+        """Oldest wait first (``runs.read``; questions and approval ``arguments`` with
+        ``runs.data``)."""
+        return self._one(InboxList, self._get(f"tenants/{_p(tenant_id)}/inbox"))
+
+
+def _rfc3339(value: datetime | str | None) -> str | None:
+    return value.isoformat() if isinstance(value, datetime) else value
 
 
 class Evals(_Resource):
@@ -1135,6 +1339,8 @@ class CalibanAdmin:
         self.intents = Intents(self)
         self.rag = Rag(self)
         self.nodes = Nodes(self)
+        self.runs = Runs(self)
+        self.inbox = Inbox(self)
         self.evals = Evals(self)
         self.usage = Usage(self)
 
