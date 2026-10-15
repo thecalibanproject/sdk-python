@@ -20,6 +20,7 @@ __all__ = [
     "ApiKeyCreate",
     "ApiKeyCreated",
     "ApiKeyInfo",
+    "ApiKeyUpdate",
     "CacheTier",
     "Datasource",
     "DatasourceCreate",
@@ -70,7 +71,12 @@ __all__ = [
     "ModelDiscovery",
     "ModelKind",
     "Node",
+    "NodeCaps",
     "NodeCreate",
+    "NodeRoute",
+    "NodeSpend",
+    "NodeSpendAmounts",
+    "NodeSpendCaps",
     "NotApplicable",
     "Ontology",
     "OntologyBatchReview",
@@ -122,10 +128,13 @@ __all__ = [
     "TenantUpdate",
     "TrialError",
     "TrustTier",
+    "UsageByNode",
     "UsageByPurpose",
+    "UsageByRoute",
     "UsageEvent",
     "UsagePurpose",
     "UsageReport",
+    "UsageTimings",
     "UsageTotals",
     "VerdictCheck",
 ]
@@ -262,6 +271,33 @@ class Health(_Response):
     version: str
     mode: Literal["router", "control-plane", "standalone"]
     config_version: str | None = None
+    store: Literal["memory", "postgres"] | None = None
+    """Control plane only: the active store backend."""
+
+
+class NodeCaps(_Request):
+    """Caps every node version's budgets must fit (``components.schemas.NodeCaps``)."""
+
+    steps: int = Field(ge=1)
+    tokens: int = Field(ge=1)
+    wall_clock_s: int = Field(ge=1)
+    depth: int = Field(ge=1)
+    fanout: int = Field(ge=1)
+    usd: float | None = Field(default=None, gt=0)
+    """When set, every version must declare ``budgets.usd`` within it."""
+
+
+class NodeSpendCaps(_Request):
+    """Caps on what the tenant's node runs spend on model calls, per UTC day and month
+    (``components.schemas.NodeSpendCaps``). A cap reached ends runs as
+    ``budget_exhausted``."""
+
+    daily_usd: float | None = Field(default=None, ge=0)
+    monthly_usd: float | None = Field(default=None, ge=0)
+
+
+NodeRoute = Annotated[str, Field(pattern=r"^node/[a-z0-9_-]+(@(v[1-9][0-9]*|published))?$")]
+"""``node/<name>`` (the live version), ``node/<name>@published`` or ``node/<name>@v<N>``."""
 
 
 class Tenant(_Response):
@@ -292,10 +328,24 @@ class Tenant(_Response):
     """Share of the flat ``caliban/auto`` price billed for this tenant's cache hits, 0..1.
     ``None``: the deployment's ``[routing] auto_cache_hit_fraction`` (0.2 unless configured)
     applies, or an older server."""
+    node_caps: NodeCaps | None = None
+    """Caps on the budgets of published node versions; ``None``: the defaults (steps 200,
+    tokens 2 000 000, wall_clock_s 3600, depth 5, fanout 32)."""
+    node_spend_caps: NodeSpendCaps | None = None
+    """Daily and monthly caps on node spend; ``None``: none."""
+    node_routes: dict[str, str] | None = None
+    """Intents ``caliban/auto`` hands to the tenant's nodes: intent id to ``node/<name>``,
+    ``node/<name>@published`` or ``node/<name>@v<N>``."""
     created_at: datetime
     status: TenantStatus | None = None
     """``"deleted"`` only appears with ``include_deleted=True``. ``None`` from older servers."""
     deleted_at: datetime | None = None
+
+    @field_validator("node_caps", "node_spend_caps", mode="before")
+    @classmethod
+    def _drop_unknown_cap_keys(cls, v: Any, info: Any) -> Any:
+        model = NodeCaps if info.field_name == "node_caps" else NodeSpendCaps
+        return _known_keys(model, v)
 
 
 class TenantCreate(_Request):
@@ -308,6 +358,9 @@ class TenantCreate(_Request):
     pii_dictionary: list[PiiTerm] | None = Field(default=None, max_length=10000)
     semantic_cache: SemanticCacheSetting | None = None
     auto_cache_hit_fraction: float | None = Field(default=None, ge=0, le=1)
+    node_caps: NodeCaps | None = None
+    node_spend_caps: NodeSpendCaps | None = None
+    node_routes: dict[str, NodeRoute] | None = None
 
 
 class TenantUpdate(_Request):
@@ -325,6 +378,13 @@ class TenantUpdate(_Request):
     """Replaced as a whole; ``[]`` clears it. Audited as a count of terms, never the terms."""
     semantic_cache: SemanticCacheSetting | None = None
     auto_cache_hit_fraction: float | None = Field(default=None, ge=0, le=1)
+    node_caps: NodeCaps | None = None
+    """Clearing it (an explicit ``null``, the defaults) goes through
+    ``tenants.update(..., node_caps="default")``."""
+    node_spend_caps: NodeSpendCaps | None = None
+    """Removing them goes through ``tenants.update(..., node_spend_caps="none")``."""
+    node_routes: dict[str, NodeRoute] | None = None
+    """Replaced as a whole. Clearing it goes through ``tenants.update(..., node_routes="none")``."""
 
 
 class ApiKeyInfo(_Response):
@@ -334,6 +394,12 @@ class ApiKeyInfo(_Response):
     created_at: datetime
     revoked_at: datetime | None = None
     """Set once the key is revoked (listed only with ``include_revoked=True``)."""
+    nodes: list[str] | None = None
+    """Node allowlist. ``None``: every published node of the tenant; ``[]``: none."""
+    datasource_scopes: list[str] | None = None
+    """Datasource scopes the built-in query tool may read, and collections
+    (``rag.<collection>:read``) ``rag_search`` may search, for this key. ``None``: every scope
+    of the nodes it runs."""
     purpose: Literal["eval"] | None = None
     """``"eval"``: the tenant's eval key, managed by the control plane (it cannot be revoked
     through ``api_keys.revoke``; rotate it with ``evals.rotate_key``)."""
@@ -348,6 +414,14 @@ class ApiKeyCreate(_Request):
     name: str | None = None
 
 
+class ApiKeyUpdate(_Request):
+    """Body of ``PATCH .../api-keys/{keyId}``. Absent fields are kept; an explicit ``null``
+    lifts the restriction (see :meth:`caliban.admin.client.ApiKeys.update`)."""
+
+    nodes: list[str] | None = None
+    datasource_scopes: list[str] | None = None
+
+
 class ProviderKey(_Response):
     id: str
     tenant_id: str
@@ -356,6 +430,8 @@ class ProviderKey(_Response):
     base_url: str | None = None
     trust_tier: TrustTier
     last4: str | None = None
+    cache_salt: bool | None = None
+    """A per-tenant ``cache_salt`` is sent (vLLM prefix-cache isolation)."""
     created_at: datetime
 
 
@@ -367,6 +443,9 @@ class ProviderKeyCreate(_Request):
     """Provider id referenced by the model catalogue; defaults to the slugified label."""
     base_url: str | None = None
     api_key: str | None = Field(default=None, repr=False)
+    cache_salt: bool | None = None
+    """Send a per-tenant ``cache_salt`` (vLLM prefix-cache isolation). Server default
+    ``False``."""
 
 
 class Model(_Response):
@@ -384,6 +463,15 @@ class Model(_Response):
     context_window: int | None = None
     price_in_per_mtok: float | None = None
     price_out_per_mtok: float | None = None
+    price_cache_read_per_mtok: float | None = None
+    """USD per million prompt tokens read from the provider prompt cache. ``None``:
+    ``price_in_per_mtok``."""
+    price_cache_write_per_mtok: float | None = None
+    """USD per million prompt tokens written to the provider prompt cache (Anthropic, 5-minute
+    TTL). ``None``: ``price_in_per_mtok``."""
+    price_cache_write_1h_per_mtok: float | None = None
+    """USD per million tokens written with the Anthropic 1-hour TTL. ``None``:
+    ``price_cache_write_per_mtok``."""
 
 
 class ModelCreate(_Request):
@@ -404,6 +492,9 @@ class ModelCreate(_Request):
     context_window: int | None = None
     price_in_per_mtok: float | None = None
     price_out_per_mtok: float | None = None
+    price_cache_read_per_mtok: float | None = Field(default=None, ge=0)
+    price_cache_write_per_mtok: float | None = Field(default=None, ge=0)
+    price_cache_write_1h_per_mtok: float | None = Field(default=None, ge=0)
 
 
 class SharedProvider(_Response):
@@ -473,6 +564,9 @@ class Datasource(_Response):
     name: str
     status: DatasourceStatus
     epoch: int | None = None
+    connection: dict[str, Any] | None = None
+    """Redacted connection settings: credentials masked (``****``), ``{env}``/``{file}``
+    references as they are. Credentials are never returned."""
 
 
 class DatasourceCreate(_Request):
@@ -645,6 +739,9 @@ class TenantIntentSet(_Response):
     exemplars: list[str] = Field(default_factory=list)
     """As stored: trimmed, duplicates dropped."""
     source: Literal["api"] = "api"
+    config_version: str | None = None
+    """The snapshot version (``cp-<n>``) that carries the change: a router serves it once its
+    ``/healthz`` reports ``routing.version`` at ``cp-<n>`` or later."""
 
 
 class TenantIntents(_Response):
@@ -796,6 +893,23 @@ class NodeCreate(_Request):
     spec: dict[str, Any]
 
 
+class UsageTimings(_Response):
+    """Per-stage durations of a request in milliseconds (``components.schemas.UsageTimings``).
+    A stage that did not run is ``None``. For streams ``upstream_total_ms`` and ``total_ms``
+    run to the end of the stream."""
+
+    auth_ms: float | None = None
+    route_ms: float | None = None
+    """Classification and model choice, ``embed_ms`` included."""
+    embed_ms: float | None = None
+    pii_ms: float | None = None
+    cache_ms: float | None = None
+    upstream_ms: float | None = None
+    """Time to the upstream response headers (first byte)."""
+    upstream_total_ms: float | None = None
+    total_ms: float | None = None
+
+
 class UsageEvent(_Response):
     request_id: str
     tenant_id: str
@@ -837,6 +951,26 @@ class UsageEvent(_Response):
     purpose: UsagePurpose | None = None
     """Work Caliban did on the tenant's behalf (``rag.ingest``, ``rag.search``). ``None`` for
     client calls and node model calls."""
+    cache_write_tokens: int | None = None
+    """Part of ``prompt_tokens`` written to the provider prompt cache (Anthropic). Omitted
+    when 0."""
+    cache_write_1h_tokens: int | None = None
+    """Part of ``cache_write_tokens`` written with the Anthropic 1-hour TTL."""
+    usage_source: Literal["provider", "estimated"] | None = None
+    """``provider``: the provider's usage report. ``estimated``: no complete report arrived
+    (a client disconnect, a failed stream, a model with ``rejects_stream_options``), so the
+    gateway estimated the tokens."""
+    node: str | None = None
+    """Node model calls only: the run's root node."""
+    node_version: int | None = None
+    run_id: str | None = None
+    route: str | None = None
+    """In transit only, never in reports: the path a ``caliban/auto`` request took."""
+    route_fallback: str | None = None
+    """In transit only, never in reports (counted in ``by_route``)."""
+    timings: UsageTimings | None = None
+    """Per-stage durations of the request (the ``Server-Timing`` numbers). ``None`` on events
+    written before the field existed."""
 
 
 class UsageTotals(_Response):
@@ -864,11 +998,61 @@ class UsageTotals(_Response):
     """Sum over the same events (``0`` on cache hits)."""
     margin_usd: float | None = None
     """``billed_usd - routed_model_cost_usd``."""
+    charged_usd: float | None = None
+    """What the customer is charged: the billed ``caliban/auto`` price, the model's cost
+    otherwise. Over a run's events it equals the run's ``cost_usd``."""
+    cached_prompt_tokens: int | None = None
+    """Prompt tokens read from provider prompt caches."""
+    cache_write_tokens: int | None = None
+    """Prompt tokens written to provider prompt caches."""
+    estimated_requests: int | None = None
+    """Events with ``usage_source="estimated"``."""
 
 
 class UsageByPurpose(_Response):
     purpose: str
     totals: UsageTotals
+
+
+class UsageByNode(_Response):
+    node: str | None = None
+    node_version: int | None = None
+    totals: UsageTotals | None = None
+
+
+class UsageByRoute(_Response):
+    """Requests per tenant, UTC day, intent, deciding stage and fallback reason (empty
+    strings: not set). The only routing record kept."""
+
+    tenant_id: str
+    day: str
+    intent: str
+    route_stage: str
+    route_fallback: str
+    requests: int
+
+
+class NodeSpendAmounts(_Response):
+    daily_usd: float | None = None
+    """``None``: no cap."""
+    monthly_usd: float | None = None
+
+
+class NodeSpend(_Response):
+    """``GET /api/v1/tenants/{tenantId}/node-spend``: what the tenant's node runs spent on
+    model calls today and this month (UTC), next to its ``node_spend_caps``."""
+
+    tenant_id: str
+    day: str
+    """``YYYY-MM-DD`` (UTC)."""
+    month: str
+    """``YYYY-MM`` (UTC)."""
+    today_usd: float
+    month_usd: float
+    caps: NodeSpendAmounts
+    remaining: NodeSpendAmounts
+    capped: bool
+    """A cap is reached: runs stop at their next model call."""
 
 
 class UsageReport(_Response):
@@ -877,6 +1061,10 @@ class UsageReport(_Response):
     by_purpose: list[UsageByPurpose] | None = None
     """The totals per ``purpose``, so retrieval spend is separable from the tenant's own
     calls. ``None`` from older servers."""
+    by_node: list[UsageByNode] | None = None
+    """The same totals per node version (node calls only)."""
+    by_route: list[UsageByRoute] | None = None
+    """Not computed when the report is filtered by node or run."""
 
 
 # ───────────────────────────── evals ─────────────────────────────

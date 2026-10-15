@@ -27,6 +27,7 @@ from .models import (
     ApiKeyCreate,
     ApiKeyCreated,
     ApiKeyInfo,
+    ApiKeyUpdate,
     Datasource,
     DatasourceCreate,
     DatasourceKind,
@@ -55,7 +56,10 @@ from .models import (
     ModelDiscovery,
     ModelKind,
     Node,
+    NodeCaps,
     NodeCreate,
+    NodeSpend,
+    NodeSpendCaps,
     Ontology,
     OntologyBatchReview,
     OntologyDecision,
@@ -184,10 +188,13 @@ class Tenants(_Resource):
         pii_dictionary: Sequence[PiiTerm | Mapping[str, Any]] | None = None,
         semantic_cache: SemanticCacheSetting | None = None,
         auto_cache_hit_fraction: float | None = None,
+        node_caps: NodeCaps | Mapping[str, Any] | None = None,
+        node_spend_caps: NodeSpendCaps | Mapping[str, Any] | None = None,
+        node_routes: Mapping[str, str] | None = None,
     ) -> Tenant:
         """Create a tenant. ``auto_cache_hit_fraction`` (0..1) overrides the share of the flat
         ``caliban/auto`` price billed for its cache hits; omit it for the deployment value.
-        The PII arguments are those of :meth:`update`."""
+        The PII and node arguments are those of :meth:`update`."""
         body = TenantCreate.model_validate(
             {
                 "name": name,
@@ -199,6 +206,9 @@ class Tenants(_Resource):
                 "pii_dictionary": _pii_list(pii_dictionary),
                 "semantic_cache": semantic_cache,
                 "auto_cache_hit_fraction": auto_cache_hit_fraction,
+                "node_caps": _model_dict(node_caps),
+                "node_spend_caps": _model_dict(node_spend_caps),
+                "node_routes": None if node_routes is None else dict(node_routes),
             }
         ).to_body()
         return self._one(Tenant, self._post("tenants", body))
@@ -214,6 +224,9 @@ class Tenants(_Resource):
         pii_dictionary: Sequence[PiiTerm | Mapping[str, Any]] | None = None,
         semantic_cache: SemanticCacheSetting | None = None,
         auto_cache_hit_fraction: float | Literal["default"] | None = None,
+        node_caps: NodeCaps | Mapping[str, Any] | Literal["default"] | None = None,
+        node_spend_caps: NodeSpendCaps | Mapping[str, Any] | Literal["none"] | None = None,
+        node_routes: Mapping[str, str] | Literal["none"] | None = None,
     ) -> Tenant:
         """Change a tenant's PII, cache and cache-hit billing settings (``PATCH``). Omitted
         fields keep their value.
@@ -229,12 +242,27 @@ class Tenants(_Resource):
         ``semantic_cache="on"`` lets eligible requests use the semantic cache (the deployment
         must enable it too). ``auto_cache_hit_fraction`` (0..1) is the share of the flat
         ``caliban/auto`` price billed when a cache tier answers (no model is called);
-        ``"default"`` clears the override so the deployment value applies. Audited as
+        ``"default"`` clears the override so the deployment value applies.
+        ``node_caps`` (``steps``, ``tokens``, ``wall_clock_s``, ``depth``, ``fanout``, optional
+        ``usd``) caps the budgets of published node versions; ``"default"`` restores the
+        defaults. ``node_spend_caps`` (``daily_usd``, ``monthly_usd``) caps what node runs spend
+        on model calls per UTC day and month; ``"none"`` removes them. ``node_routes`` maps
+        intents ``caliban/auto`` hands to nodes (``{"triage": "node/desk"}``, or
+        ``node/desk@v3``), replaced as a whole; ``"none"`` clears it. Audited as
         ``tenant.update``; routers apply the change with their next snapshot. Raises
         :class:`~caliban.NotFoundError` for an unknown or deleted tenant.
         """
         clear = auto_cache_hit_fraction == "default"
         fraction = None if isinstance(auto_cache_hit_fraction, str) else auto_cache_hit_fraction
+        clear_fields = [
+            name
+            for name, value in (
+                ("node_caps", node_caps),
+                ("node_spend_caps", node_spend_caps),
+                ("node_routes", node_routes),
+            )
+            if isinstance(value, str)
+        ]
         body = TenantUpdate.model_validate(
             {
                 "pii_default": pii_default,
@@ -244,11 +272,28 @@ class Tenants(_Resource):
                 "pii_dictionary": _pii_list(pii_dictionary),
                 "semantic_cache": semantic_cache,
                 "auto_cache_hit_fraction": fraction,
+                "node_caps": None if isinstance(node_caps, str) else _model_dict(node_caps),
+                "node_spend_caps": (
+                    None if isinstance(node_spend_caps, str) else _model_dict(node_spend_caps)
+                ),
+                "node_routes": (
+                    None
+                    if node_routes is None or isinstance(node_routes, str)
+                    else dict(node_routes)
+                ),
             }
         ).to_body()
         if clear:
             body["auto_cache_hit_fraction"] = None
+        for name in clear_fields:
+            body[name] = None
         return self._one(Tenant, self._patch(f"tenants/{_p(tenant_id)}", body))
+
+
+def _model_dict(value: BaseModel | Mapping[str, Any] | None) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    return value.model_dump(exclude_none=True) if isinstance(value, BaseModel) else dict(value)
 
 
 def _pii_list(items: Sequence[BaseModel | Mapping[str, Any]] | None) -> list[Any] | None:
@@ -284,6 +329,38 @@ class ApiKeys(_Resource):
         """
         self._delete(f"tenants/{_p(tenant_id)}/api-keys/{_p(key_id)}")
 
+    def update(
+        self,
+        tenant_id: str,
+        key_id: str,
+        *,
+        nodes: Sequence[str] | Literal["all"] | None = None,
+        datasource_scopes: Sequence[str] | Literal["all"] | None = None,
+    ) -> ApiKeyInfo:
+        """Change a key's node allowlist and datasource scopes (``PATCH``).
+
+        ``None`` keeps a field. ``nodes=["desk"]`` lets the key run only that node (``[]``:
+        none); ``nodes="all"`` lifts the allowlist (every published node of the tenant).
+        ``datasource_scopes`` narrows what the built-in query tool and ``rag_search`` may read
+        for this key; ``"all"`` lifts it (every scope of the nodes it runs). Changing node
+        access needs ``nodes.run`` on the tenant (:class:`~caliban.PermissionDeniedError`
+        otherwise). Audited as ``api_key.update``; routers apply it with their next snapshot.
+        """
+        body = ApiKeyUpdate(
+            nodes=None if nodes is None or isinstance(nodes, str) else [*nodes],
+            datasource_scopes=(
+                None
+                if datasource_scopes is None or isinstance(datasource_scopes, str)
+                else [*datasource_scopes]
+            ),
+        ).to_body()
+        if nodes == "all":
+            body["nodes"] = None
+        if datasource_scopes == "all":
+            body["datasource_scopes"] = None
+        path = f"tenants/{_p(tenant_id)}/api-keys/{_p(key_id)}"
+        return self._one(ApiKeyInfo, self._patch(path, body))
+
 
 class ProviderKeys(_Resource):
     """BYOK provider credentials and local endpoints. Secrets are write-only."""
@@ -301,7 +378,10 @@ class ProviderKeys(_Resource):
         base_url: str | None = None,
         api_key: str | None = None,
         provider_id: str | None = None,
+        cache_salt: bool | None = None,
     ) -> ProviderKey:
+        """Add a BYOK credential or a local endpoint. ``cache_salt=True`` sends a per-tenant
+        ``cache_salt`` (vLLM prefix-cache isolation)."""
         body = ProviderKeyCreate(
             kind=kind,
             label=label,
@@ -309,6 +389,7 @@ class ProviderKeys(_Resource):
             base_url=base_url,
             api_key=api_key,
             provider_id=provider_id,
+            cache_salt=cache_salt,
         ).to_body()
         return self._one(ProviderKey, self._post(f"tenants/{_p(tenant_id)}/provider-keys", body))
 
@@ -339,6 +420,9 @@ class Models(_Resource):
         context_window: int | None = None,
         price_in_per_mtok: float | None = None,
         price_out_per_mtok: float | None = None,
+        price_cache_read_per_mtok: float | None = None,
+        price_cache_write_per_mtok: float | None = None,
+        price_cache_write_1h_per_mtok: float | None = None,
     ) -> Model:
         """Register a model, e.g. an open model served on-prem.
 
@@ -362,6 +446,9 @@ class Models(_Resource):
             "context_window": context_window,
             "price_in_per_mtok": price_in_per_mtok,
             "price_out_per_mtok": price_out_per_mtok,
+            "price_cache_read_per_mtok": price_cache_read_per_mtok,
+            "price_cache_write_per_mtok": price_cache_write_per_mtok,
+            "price_cache_write_1h_per_mtok": price_cache_write_1h_per_mtok,
         }
         overrides = {k: v for k, v in fields.items() if v is not None}
         if spec is None:
@@ -994,6 +1081,12 @@ class Usage(_Resource):
         if not 1 <= limit <= 1000:
             raise CalibanError("limit must be between 1 and 1000")
         return self._one(UsageReport, self._get("usage", {"tenant_id": tenant_id, "limit": limit}))
+
+    def node_spend(self, tenant_id: str) -> NodeSpend:
+        """What the tenant's node runs spent today and this month (UTC) against its
+        ``node_spend_caps``: ``remaining`` (``None``: no cap) and ``capped`` (``usage.read``;
+        :class:`~caliban.ServiceUnavailableError` without a node journal)."""
+        return self._one(NodeSpend, self._get(f"tenants/{_p(tenant_id)}/node-spend"))
 
 
 class CalibanAdmin:

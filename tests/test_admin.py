@@ -1524,3 +1524,215 @@ def test_injection_verdict_answer_integrity() -> None:
         }
     )
     assert (v.category, v.defenses) == ("answer_integrity", ["answer_guard"])
+
+
+# ─────────────────── contract drift (core 45d1b16) ───────────────────
+
+
+def test_tenant_node_caps_spend_caps_and_routes(admin: CalibanAdmin) -> None:
+    caps = {"steps": 50, "tokens": 200000, "wall_clock_s": 600, "depth": 3, "fanout": 8}
+    tenant = {
+        **TENANT,
+        "node_caps": {**caps, "usd": 2.5, "future": 1},
+        "node_spend_caps": {"daily_usd": 5, "monthly_usd": None},
+        "node_routes": {"triage": "node/desk"},
+    }
+    r = router(admin)
+    create = r.post("/tenants").respond(201, json=tenant)
+    patch = r.patch("/tenants/t1").respond(200, json=TENANT)
+
+    t = admin.tenants.create(
+        name="Acme",
+        node_caps=m.NodeCaps(**caps),
+        node_spend_caps={"daily_usd": 5},
+        node_routes={"triage": "node/desk@v3"},
+    )
+    assert json.loads(create.calls.last.request.content) == {
+        "name": "Acme",
+        "node_caps": caps,
+        "node_spend_caps": {"daily_usd": 5},
+        "node_routes": {"triage": "node/desk@v3"},
+    }
+    assert t.node_caps is not None and t.node_caps.usd == 2.5
+    assert t.node_spend_caps is not None and t.node_spend_caps.daily_usd == 5
+    assert t.node_routes == {"triage": "node/desk"}
+    # Older servers: absent.
+    assert admin.tenants.update("t1", node_routes={"faq": "node/kb@published"}).node_caps is None
+    assert json.loads(patch.calls.last.request.content) == {
+        "node_routes": {"faq": "node/kb@published"}
+    }
+    # Explicit nulls: defaults back, caps removed, routes cleared.
+    admin.tenants.update("t1", node_caps="default", node_spend_caps="none", node_routes="none")
+    assert json.loads(patch.calls.last.request.content) == {
+        "node_caps": None,
+        "node_spend_caps": None,
+        "node_routes": None,
+    }
+    with pytest.raises(ValueError, match="pattern"):
+        admin.tenants.update("t1", node_routes={"faq": "kb"})
+
+
+def test_api_key_scopes_and_update(admin: CalibanAdmin) -> None:
+    info = {"id": "k1", "name": "ci", "prefix": "cal_abcd", "created_at": TS}
+    r = router(admin)
+    patch = r.patch("/tenants/t1/api-keys/k1").respond(
+        200, json={**info, "nodes": ["desk"], "datasource_scopes": ["erp.invoices:read"]}
+    )
+    key = admin.api_keys.update("t1", "k1", nodes=["desk"], datasource_scopes=["erp.invoices:read"])
+    assert (key.nodes, key.datasource_scopes) == (["desk"], ["erp.invoices:read"])
+    assert json.loads(patch.calls.last.request.content) == {
+        "nodes": ["desk"],
+        "datasource_scopes": ["erp.invoices:read"],
+    }
+    admin.api_keys.update("t1", "k1", nodes="all")
+    assert json.loads(patch.calls.last.request.content) == {"nodes": None}
+    admin.api_keys.update("t1", "k1", nodes=[], datasource_scopes="all")
+    assert json.loads(patch.calls.last.request.content) == {
+        "nodes": [],
+        "datasource_scopes": None,
+    }
+
+
+def test_api_key_update_not_retried_on_502(admin: CalibanAdmin) -> None:
+    route = router(admin).patch("/tenants/t1/api-keys/k1").respond(502)
+    with pytest.raises(UpstreamError):
+        admin.api_keys.update("t1", "k1", nodes=["desk"])
+    assert route.call_count == 1
+
+
+def test_catalogue_and_provider_fields(admin: CalibanAdmin) -> None:
+    model = {
+        "id": "anthropic/claude",
+        "provider_id": "anthropic",
+        "upstream_model": "claude",
+        "trust_tier": "t2_contracted",
+        "kind": "chat",
+        "capabilities": {"tools": True, "rejects_stream_options": True},
+        "price_in_per_mtok": 3,
+        "price_cache_read_per_mtok": 0.3,
+        "price_cache_write_per_mtok": 3.75,
+        "price_cache_write_1h_per_mtok": 6,
+    }
+    pk = {
+        "id": "p1",
+        "tenant_id": "t1",
+        "kind": "openai_compatible",
+        "label": "vllm",
+        "trust_tier": "t0_sovereign",
+        "cache_salt": True,
+        "created_at": TS,
+    }
+    r = router(admin)
+    post_model = r.post("/models").respond(201, json=model)
+    post_pk = r.post("/tenants/t1/provider-keys").respond(201, json=pk)
+    r.get("/health").respond(
+        200, json={"status": "ok", "version": "0.1.0", "mode": "control-plane", "store": "postgres"}
+    )
+    r.get("/datasources").respond(
+        200,
+        json=[
+            {
+                "id": "d1",
+                "tenant_id": "t1",
+                "kind": "mongodb",
+                "name": "sales",
+                "status": "ready",
+                "connection": {"uri": "mongodb://app:****@mongo:27017", "database": "sales"},
+            }
+        ],
+    )
+
+    got = admin.models.create(
+        id="anthropic/claude",
+        provider="anthropic",
+        upstream_model="claude",
+        trust_tier="t2_contracted",
+        price_cache_read_per_mtok=0.3,
+        price_cache_write_1h_per_mtok=6,
+    )
+    sent = json.loads(post_model.calls.last.request.content)
+    assert (sent["price_cache_read_per_mtok"], sent["price_cache_write_1h_per_mtok"]) == (0.3, 6)
+    assert (got.price_cache_write_per_mtok, got.capabilities.rejects_stream_options) == (3.75, True)
+    with pytest.raises(ValueError, match="greater than or equal to 0"):
+        admin.models.create(
+            id="x/y", provider="x", upstream_model="y", trust_tier="t3_public",
+            price_cache_read_per_mtok=-1,
+        )  # fmt: skip
+    assert admin.provider_keys.create(
+        "t1", kind="openai_compatible", label="vllm", trust_tier="t0_sovereign", cache_salt=True
+    ).cache_salt
+    assert json.loads(post_pk.calls.last.request.content)["cache_salt"] is True
+    assert admin.health().store == "postgres"
+    conn = admin.datasources.list()[0].connection
+    assert conn is not None and conn["uri"] == "mongodb://app:****@mongo:27017"
+
+
+def test_intent_put_reports_config_version(admin: CalibanAdmin) -> None:
+    router(admin).put("/tenants/t1/intents/faq").respond(
+        200,
+        json={
+            "tenant_id": "t1",
+            "intent": "faq",
+            "exemplars": ["how do I"],
+            "source": "api",
+            "config_version": "cp-42",
+        },
+    )
+    assert admin.intents.put("t1", "faq", ["how do I"]).config_version == "cp-42"
+
+
+def test_usage_timings_cache_writes_node_and_routes(admin: CalibanAdmin) -> None:
+    event = {
+        **USAGE_BASE,
+        "cache_write_tokens": 1200,
+        "cache_write_1h_tokens": 200,
+        "usage_source": "estimated",
+        "node": "desk",
+        "node_version": 3,
+        "run_id": "run_1",
+        "timings": {"auth_ms": 0.21, "route_ms": 4.81, "upstream_ms": 182.4, "total_ms": 618.7},
+    }
+    totals = {"requests": 1, "charged_usd": 0.01, "cached_prompt_tokens": 40,
+              "cache_write_tokens": 1200, "estimated_requests": 1}  # fmt: skip
+    by_route = {"tenant_id": "t1", "day": "2026-10-15", "intent": "faq", "route_stage": "knn",
+                "route_fallback": "", "requests": 4}  # fmt: skip
+    router(admin).get("/usage").respond(
+        200,
+        json={
+            "events": [event],
+            "totals": totals,
+            "by_node": [{"node": "desk", "node_version": 3, "totals": totals}],
+            "by_route": [by_route],
+        },
+    )
+    rep = admin.usage.get(tenant_id="t1")
+    e = rep.events[0]
+    assert (e.cache_write_tokens, e.cache_write_1h_tokens, e.usage_source) == (
+        1200,
+        200,
+        "estimated",
+    )
+    assert (e.node, e.node_version, e.run_id) == ("desk", 3, "run_1")
+    assert e.timings is not None and (e.timings.route_ms, e.timings.pii_ms) == (4.81, None)
+    assert (rep.totals.charged_usd, rep.totals.estimated_requests) == (0.01, 1)
+    assert rep.by_node is not None and rep.by_node[0].totals is not None
+    assert rep.by_route is not None and rep.by_route[0].requests == 4
+
+
+def test_node_spend(admin: CalibanAdmin) -> None:
+    router(admin).get("/tenants/t1/node-spend").respond(
+        200,
+        json={
+            "tenant_id": "t1",
+            "day": "2026-10-15",
+            "month": "2026-10",
+            "today_usd": 1.25,
+            "month_usd": 30,
+            "caps": {"daily_usd": 5, "monthly_usd": None},
+            "remaining": {"daily_usd": 3.75, "monthly_usd": None},
+            "capped": False,
+        },
+    )
+    spend = admin.usage.node_spend("t1")
+    assert (spend.remaining.daily_usd, spend.remaining.monthly_usd) == (3.75, None)
+    assert (spend.today_usd, spend.capped) == (1.25, False)

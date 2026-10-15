@@ -406,6 +406,9 @@ class ModelCapabilities(BaseModel):
     reasoning_control: Literal["none", "enable_thinking", "reasoning_effort"] = "none"
     inline_think_tags: bool = False
     """Server returns ``<think>...</think>`` in content; Caliban moves it to reasoning_content."""
+    rejects_stream_options: bool = False
+    """The server rejects ``stream_options``: Caliban does not ask it for usage on streams and
+    meters them from an estimate (``usage_source="estimated"``)."""
 
 
 class ModelCalibanInfo(BaseModel):

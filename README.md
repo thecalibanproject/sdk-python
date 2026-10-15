@@ -280,7 +280,7 @@ print(admin.usage.get(tenant_id=t.id, limit=100).totals)
 | Resource | Methods |
 |---|---|
 | `tenants` | `list` (`include_deleted=`), `get`, `create`, `update`, `delete` |
-| `api_keys` | `list` (`include_revoked=`), `create`, `revoke` |
+| `api_keys` | `list` (`include_revoked=`), `create`, `update` (`nodes=`, `datasource_scopes=`; `"all"` lifts either), `revoke` |
 | `provider_keys` | `list`, `create`, `delete` |
 | `models` | `list`, `create`, `delete` |
 | `providers` | `list`, `create`, `delete`, `health`, `discover` |
@@ -290,7 +290,7 @@ print(admin.usage.get(tenant_id=t.id, limit=100).totals)
 | `rag` | `models`, `collections.list`, `.create`, `.get`, `.delete`, `documents.list`, `.ingest`, `.get`, `.delete`, `.release` |
 | `nodes` | `list`, `create` (validates `spec` locally first; `validate_spec=False` skips that), `delete` |
 | `evals` | `get_golden_set`, `put_golden_set`, `delete_golden_set`, `get_policy`, `set_policy`, `start`, `list`, `get`, `cancel`, `wait`, `gate`, `get_key`, `rotate_key` (see [Server-side evals](#server-side-evals-and-the-promotion-gate)) |
-| `usage` | `get` (`limit` between 1 and 1000) |
+| `usage` | `get` (`limit` between 1 and 1000), `node_spend` (node spend today and this month against the tenant's caps) |
 
 The constructor takes `token`, `base_url`, `timeout` (default 30 s), `max_retries`, `default_headers` and `http_client`. GET and DELETE requests retry on 429, 502 and 503. POST and PATCH requests retry only on 429 and 503, because a 502 may mean the server already acted (see [Retries](#retries)). The response models live in `caliban.admin.models`.
 
@@ -307,6 +307,9 @@ The constructor takes `token`, `base_url`, `timeout` (default 30 s), `max_retrie
 | `pii_dictionary` | list of `PiiTerm` or mappings (at most 10 000) | `[]` | Whole-word, case-insensitive terms to protect: `{term, label}` (customer names, internal codes); the label is case-insensitive too. Replaced as a whole; `[]` clears it. Audited as a count of terms, never the terms. |
 | `semantic_cache` | `"off"`, `"on"` | `"off"` | Whether the tenant's eligible requests may use the semantic cache. |
 | `auto_cache_hit_fraction` | `0` to `1`, or `"default"` | deployment value | Share of the flat `caliban/auto` price billed for the tenant's cache hits. `"default"` clears the override, so the deployment's `[routing] auto_cache_hit_fraction` (0.2 unless configured) applies. |
+| `node_caps` | `NodeCaps` or a mapping, or `"default"` | steps 200, tokens 2 000 000, wall_clock_s 3600, depth 5, fanout 32 | Caps the budgets of published node versions must fit; with `usd`, every version must declare `budgets.usd` within it. `"default"` restores the defaults. |
+| `node_spend_caps` | `NodeSpendCaps` or a mapping, or `"none"` | none | What node runs may spend on model calls per UTC day (`daily_usd`) and month (`monthly_usd`), across workers. A cap reached ends runs as `budget_exhausted`. `"none"` removes them; `admin.usage.node_spend(t.id)` shows where the tenant stands. |
+| `node_routes` | mapping of intent to `node/<name>`, `node/<name>@published` or `node/<name>@v<N>`, or `"none"` | config file | Intents `caliban/auto` hands to the tenant's nodes, over the config file's, intent by intent. Replaced as a whole; `"none"` clears it. |
 
 ```python
 admin.tenants.update(t.id, semantic_cache="on")
@@ -338,11 +341,15 @@ These fields are `None` on tenants from an older server.
 | `flat_price_usd` | `caliban/auto` | The full flat auto price for the same tokens. On a cache hit, the flat price of the cached answer's tokens (what a miss would have billed). |
 | `billed_usd` | `caliban/auto` | What the customer is billed: `flat_price_usd` on a miss, `flat_price_usd` times the tenant's cache-hit fraction on a hit. |
 | `saved_usd` | Priced cache hits | What the hit saved: `flat_price_usd - billed_usd` for `caliban/auto`, the avoided model cost for other models. |
+| `timings` | Events from a current gateway | Per-stage durations in ms (`UsageTimings`): `auth_ms`, `route_ms`, `embed_ms`, `pii_ms`, `cache_ms`, `upstream_ms` (to the first byte), `upstream_total_ms`, `total_ms`. The same numbers as the `Server-Timing` response header; a stage that did not run is `None`. |
+| `cache_write_tokens`, `cache_write_1h_tokens` | Provider prompt-cache writes | Part of `prompt_tokens` written to the provider prompt cache (Anthropic), and of those, written with the 1-hour TTL. Priced with the model's `price_cache_write_per_mtok` and `price_cache_write_1h_per_mtok`. |
+| `usage_source` | Every event from a current gateway | `"provider"` (the provider's usage report) or `"estimated"` (no complete report arrived: a client disconnect, a failed stream, or a model with `rejects_stream_options`). |
+| `node`, `node_version`, `run_id` | Node model calls | The run's root node, its version and the run. |
 | `purpose` | Work Caliban did for the tenant | `"rag.ingest"` (embedding a collection's documents) or `"rag.search"` (a node's retrieval query, its embedding and reranking). `None` on client calls and node model calls. |
 
-`by_purpose` gives the same totals per `purpose` (`UsageByPurpose`), so retrieval spend is separable from the tenant's own calls; it is `None` from an older server.
+`by_purpose` gives the same totals per `purpose` (`UsageByPurpose`), so retrieval spend is separable from the tenant's own calls; it is `None` from an older server. `by_node` gives them per node version (`UsageByNode`), and `by_route` counts requests per tenant, UTC day, intent, deciding stage and fallback reason (`UsageByRoute`), the only routing record kept: reported events never carry their intent or route.
 
-`totals` adds `semantic_cache_hits` (`cache_hits` counts both tiers), `saved_usd` (what cache hits saved, all models), `auto_requests` (requests for `caliban/auto`) and `auto_cache_hits`, and, summed over the `caliban/auto` events that carry both prices, `flat_price_usd`, `billed_usd`, `auto_saved_usd`, `routed_model_cost_usd` and `margin_usd` (`billed_usd - routed_model_cost_usd`).
+`totals` adds `charged_usd` (what the customer is charged: the billed `caliban/auto` price, the model's cost otherwise), `cached_prompt_tokens` and `cache_write_tokens` (provider prompt caches), `estimated_requests` (events with `usage_source="estimated"`), `semantic_cache_hits` (`cache_hits` counts both tiers), `saved_usd` (what cache hits saved, all models), `auto_requests` (requests for `caliban/auto`) and `auto_cache_hits`, and, summed over the `caliban/auto` events that carry both prices, `flat_price_usd`, `billed_usd`, `auto_saved_usd`, `routed_model_cost_usd` and `margin_usd` (`billed_usd - routed_model_cost_usd`).
 
 ```python
 totals = admin.usage.get(tenant_id=t.id).totals
