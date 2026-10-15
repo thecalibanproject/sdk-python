@@ -1089,11 +1089,20 @@ class GoldenCase(_Request):
     JSON with the output parsed as JSON."""
     checks: list[dict[str, Any]] | None = None
     """``exact``, ``contains``, ``regex``, ``json_schema`` or ``llm_judge`` checks, in the
-    format of :mod:`caliban.evals` datasets."""
+    format of :mod:`caliban.evals` datasets, and server-side only ``tool_call`` checks
+    (``{"type": "tool_call", "tool": "mcp://bank/refund", "args": {...}}``, or
+    ``"must_not_call": True``). An ``llm_judge`` check may carry a ``reference`` answer."""
     answers: dict[str, Any] | None = None
     """Scripted answers to human steps, by step id (``clarify#0``, ``write#0@approve``) or
     vertex id (``clarify``, ``write@approve``)."""
+    tool_results: dict[str, Any] | None = None
+    """Scripted tool results, by tool name (``refund``) or reference. A trial never calls a
+    write tool: the eval sandbox answers this script, else a synthetic result marked
+    ``"sandbox": true``. A read tool named here answers the script too; other reads call the
+    real tool."""
     tags: list[str] | None = None
+    """Free labels. A case captured from a run has ``captured``, its verdict and
+    ``mast:<id>``."""
 
     @classmethod
     def from_case(cls, case: Case) -> GoldenCase:
@@ -1262,7 +1271,9 @@ class GoldenSummary(_Response):
 class InjectionCategory(_Response):
     trials: int
     blocked: int
-    pass_rate: float
+    errors: int | None = None
+    pass_rate: float | None = None
+    """``None`` when no trial of the category was scored."""
 
 
 class NotApplicable(_Response):
@@ -1274,6 +1285,10 @@ class InjectionCaseResult(_Response):
     case: str
     trial: int
     blocked: bool
+    outcome: Literal["blocked", "succeeded", "error"] | None = None
+    error_kind: str | None = None
+    """With ``outcome="error"``: ``quota``, ``provider``, ``timeout``, ``run_not_created``
+    or ``unscored``."""
     attacked: bool | None = None
     defenses: list[str] | None = None
     run_id: str | None = None
@@ -1285,12 +1300,20 @@ class InjectionSummary(_Response):
     suite: Literal["injection"]
     suite_version: int
     trials: int
+    """Scored trials (blocked or succeeded): errors and inapplicable cases are not in them."""
     blocked: int
-    pass_rate: float
-    """Share of attacks blocked."""
-    attack_success_rate: float
+    pass_rate: float | None
+    """Share of the scored attacks blocked; ``None`` when no trial was scored."""
+    attack_success_rate: float | None
     attacks_succeeded: int
     errors: int
+    """Trials that ended on an error (a quota, the provider, a timeout, a run that could not
+    be created): neither blocked nor succeeded."""
+    error_kinds: dict[str, int] | None = None
+    """Errors per kind: ``quota``, ``provider``, ``timeout``, ``run_not_created``,
+    ``unscored``."""
+    inconclusive: bool | None = None
+    """There are errors: the promotion gate does not accept the eval."""
     attacked: int
     """Trials where the model followed the injection."""
     utility_under_attack: float
@@ -1306,7 +1329,7 @@ EvalSummary = Annotated[GoldenSummary | InjectionSummary, Field(discriminator="s
 
 
 class VerdictCheck(_Response):
-    type: Literal["exact", "contains", "regex", "json_schema", "llm_judge"]
+    type: Literal["exact", "contains", "regex", "json_schema", "llm_judge", "tool_call"] | str
     passed: bool
     score: float | None = None
     """The judge's score (``llm_judge``)."""
@@ -1316,6 +1339,11 @@ class GoldenVerdict(_Response):
     run_status: RunStatus
     checks: list[VerdictCheck]
     judge_usd: float | None = None
+    tool_calls: int | None = None
+    """Tool calls the trial's run made (their arguments are in the sealed ``detail``)."""
+    sandboxed_calls: int | None = None
+    """Of them, the ones the eval sandbox answered (every write, and scripted reads): never
+    sent to the tool."""
 
 
 class InjectionVerdict(_Response):
@@ -1347,12 +1375,28 @@ class EvalTrial(_Response):
     cost_usd: float | None = None
     latency_ms: int | None = None
     tokens: int | None = None
-    verdict: TrialError | GoldenVerdict | InjectionVerdict | None = None
-    """Metadata, never content; the shape follows the eval's suite."""
+    verdict: Annotated[
+        TrialError | GoldenVerdict | InjectionVerdict | dict[str, Any] | None,
+        Field(union_mode="left_to_right"),
+    ] = None
+    """Metadata, never content; the shape follows the eval's suite. ``None`` while the trial
+    runs (core sends ``{}`` until it is scored; see :attr:`pending`). A plain ``dict`` for a
+    verdict shape this SDK does not know."""
     detail: Any = None
     """With ``runs.data`` only: the output and what the scorers said, or what the sandboxed
     tools received. ``None`` once run retention purged it (``Eval.content_purged``)."""
     finished_at: datetime | None = None
+
+    @field_validator("verdict", mode="before")
+    @classmethod
+    def _empty_verdict_is_none(cls, v: Any) -> Any:
+        # A trial in flight has an empty verdict object.
+        return None if v == {} else v
+
+    @property
+    def pending(self) -> bool:
+        """The trial is still running: it has no verdict yet."""
+        return self.status == "running" or (self.status is None and self.verdict is None)
 
 
 class Eval(_Response):
@@ -1391,6 +1435,12 @@ class Eval(_Response):
         """The eval ended (succeeded, failed or cancelled)."""
         return self.status in ("succeeded", "failed", "cancelled")
 
+    @property
+    def scored_trials(self) -> int:
+        """Trials of :attr:`trials` that have ended (passed, failed or error), for a progress
+        view of an eval in flight. ``0`` when the trials were not fetched (``evals.list``)."""
+        return sum(1 for t in self.trials or [] if not t.pending)
+
 
 class EvalList(_Response):
     object: str | None = None
@@ -1420,6 +1470,8 @@ class InjectionEvidence(_Response):
     eval: str
     pass_rate: float
     bar: float
+    errors: int | None = None
+    """Always 0: an eval with errors is inconclusive and does not pass."""
 
 
 class GateEvidence(_Response):

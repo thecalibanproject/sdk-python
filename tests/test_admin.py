@@ -1736,3 +1736,107 @@ def test_node_spend(admin: CalibanAdmin) -> None:
     spend = admin.usage.node_spend("t1")
     assert (spend.remaining.daily_usd, spend.remaining.monthly_usd) == (3.75, None)
     assert (spend.today_usd, spend.capped) == (1.25, False)
+
+
+# ─────────────────── evals in flight ───────────────────
+
+
+def test_eval_in_flight_parses(admin: CalibanAdmin) -> None:
+    running = {
+        **EVAL,
+        "status": "running",
+        "summary": None,
+        "claims": 1,
+        "cancel_requested": False,
+        "content_purged": False,
+        "started_at": TS,
+        "finished_at": None,
+        "content_visible": False,
+        "trials": [
+            # What core sends for a trial whose run is not scored yet.
+            {"case": "chest", "trial": 0, "run_id": "run_1", "status": "running",
+             "cost_usd": 0, "latency_ms": 0, "tokens": 0, "verdict": {}, "finished_at": None},
+            {"case": "refund", "trial": 0, "run_id": "run_2", "status": "passed",
+             "cost_usd": 0.002, "latency_ms": 900, "tokens": 300, "finished_at": TS,
+             "verdict": {"run_status": "succeeded",
+                         "checks": [{"type": "tool_call", "passed": True}],
+                         "tool_calls": 2, "sandboxed_calls": 1}},
+            {"case": "chest", "trial": 1, "run_id": None, "status": "error",
+             "verdict": {"error": "quota"}, "finished_at": TS},
+        ],
+    }  # fmt: skip
+    router(admin).get("/tenants/t1/evals/ev_1").respond(200, json=running)
+    e = admin.evals.get("t1", "ev_1")
+    assert not e.done and e.summary is None
+    assert e.trials is not None
+    in_flight, scored, failed = e.trials
+    assert in_flight.pending and in_flight.verdict is None
+    assert not scored.pending and isinstance(scored.verdict, m.GoldenVerdict)
+    assert scored.verdict.checks[0].type == "tool_call"
+    assert (scored.verdict.tool_calls, scored.verdict.sandboxed_calls) == (2, 1)
+    assert not failed.pending and isinstance(failed.verdict, m.TrialError)
+    assert e.scored_trials == 2
+
+
+def test_pending_eval_without_trials_and_unknown_verdicts() -> None:
+    pending = m.Eval.model_validate({**EVAL, "status": "pending", "summary": None})
+    assert not pending.done and pending.scored_trials == 0 and pending.trials is None
+    # A verdict shape this SDK does not know stays a dict instead of failing the eval.
+    trial = m.EvalTrial.model_validate(
+        {"case": "x", "status": "passed", "verdict": {"kind": "future", "ok": True}}
+    )
+    assert trial.verdict == {"kind": "future", "ok": True}
+    assert m.EvalTrial.model_validate({"case": "x"}).pending
+
+
+def test_inconclusive_injection_summary() -> None:
+    e = m.Eval.model_validate(
+        {
+            **EVAL,
+            "suite": "injection",
+            "status": "succeeded",
+            "summary": {
+                "suite": "injection", "suite_version": 3, "trials": 0, "blocked": 0,
+                "pass_rate": None, "attack_success_rate": None, "attacks_succeeded": 0,
+                "errors": 2, "error_kinds": {"quota": 1, "timeout": 1}, "inconclusive": True,
+                "attacked": 0, "utility_under_attack": 0,
+                "by_category": {"tainted_write": {"trials": 0, "blocked": 0, "errors": 2,
+                                                  "pass_rate": None}},
+                "not_applicable": [], "cost_usd": 0, "latency_ms": {"p50": None, "p95": None},
+                "cases": [{"case": "tw-1", "trial": 0, "blocked": False, "outcome": "error",
+                           "error_kind": "quota"}],
+            },
+        }
+    )  # fmt: skip
+    s = e.summary
+    assert isinstance(s, m.InjectionSummary)
+    assert (s.pass_rate, s.attack_success_rate, s.inconclusive) == (None, None, True)
+    assert s.error_kinds == {"quota": 1, "timeout": 1}
+    assert s.by_category["tainted_write"].errors == 2
+    assert (s.cases[0].outcome, s.cases[0].error_kind) == ("error", "quota")
+
+
+def test_golden_case_tool_results_and_tool_call_checks(admin: CalibanAdmin) -> None:
+    case = m.GoldenCase(
+        id="refund-ok",
+        input={"ticket": "refund INV-1"},
+        tool_results={"lookup_invoice": {"id": "INV-1", "amount": 40}},
+        checks=[
+            {"type": "tool_call", "tool": "mcp://bank/refund", "args": {"invoice": "INV-1"}},
+            {"type": "llm_judge", "rubric": "Refunds INV-1", "reference": {"refunded": "INV-1"}},
+        ],
+    )
+    put = router(admin).put("/tenants/t1/nodes/desk/versions/2/golden-set")
+    put.respond(
+        200,
+        json={
+            "object": "node.golden_set", "node": "desk", "version": 2, "hash": "sha256:bb",
+            "case_count": 1, "updated_at": TS, "updated_by": "u", "content_visible": True,
+            "cases": [{**case.to_body(), "tags": ["captured", "good"]}],
+        },
+    )  # fmt: skip
+    got = admin.evals.put_golden_set("t1", "desk", 2, [case])
+    sent = json.loads(put.calls.last.request.content)["cases"][0]
+    assert sent["tool_results"] == {"lookup_invoice": {"id": "INV-1", "amount": 40}}
+    assert got.cases is not None and got.cases[0].tool_results == sent["tool_results"]
+    assert got.cases[0].tags == ["captured", "good"]
