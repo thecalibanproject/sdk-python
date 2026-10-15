@@ -47,7 +47,44 @@ This also installs the `caliban-eval` command. For development, see [Development
 
 ## Quick start
 
-You need a running Caliban gateway and a tenant API key (`cal_...`).
+You need a running Caliban gateway and a tenant API key (`cal_...`). The gateway is on `http://localhost:8080` by default.
+
+### Point your existing app at Caliban
+
+If your app already uses the OpenAI or the Anthropic SDK, you do not need this package to start. Change two things, the base URL and the key, and keep your code:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8080/v1",  # was https://api.openai.com/v1
+    api_key="cal_...",  # a tenant key
+)
+resp = client.chat.completions.create(
+    model="caliban/auto",  # or any model id from GET /v1/models
+    messages=[{"role": "user", "content": "Which vendors are overdue?"}],
+)
+```
+
+```python
+from anthropic import Anthropic
+
+client = Anthropic(
+    base_url="http://localhost:8080",  # the gateway root: the SDK adds /v1/messages
+    api_key="cal_...",  # sent as x-api-key, which Caliban accepts
+)
+msg = client.messages.create(
+    model="caliban/auto",
+    max_tokens=1024,
+    messages=[{"role": "user", "content": "Which vendors are overdue?"}],
+)
+```
+
+Every request now goes through the tenant's PII screening, cache and routing. `caliban/auto` lets the router pick the model; a model id you already use keeps working if the tenant has it (`GET /v1/models` lists them). To see what Caliban did, read the `x-caliban-*` response headers (`with_raw_response` in both SDKs; `CalibanResponseMeta.from_headers` parses them), or open the tenant's usage in the console. [Using the stock OpenAI and Anthropic SDKs](#using-the-stock-openai-and-anthropic-sdks) shows how to pass the `caliban` options through them.
+
+### With this SDK
+
+`Caliban` speaks the same OpenAI wire format, types the `caliban` options and parses the response headers for you:
 
 ```python
 from caliban import Caliban
@@ -63,6 +100,8 @@ resp = client.chat.completions.create(
 print(resp.text)
 print(resp.caliban.routed_model, resp.caliban.cache, resp.caliban.pii_entities)
 ```
+
+A missing key raises a `CalibanError` that names the fix: pass `api_key=` or set `CALIBAN_API_KEY`.
 
 ## Core concepts
 
